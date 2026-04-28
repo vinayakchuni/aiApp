@@ -1,0 +1,19 @@
+{
+  "name": "@ai-app/shared",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --watch --project tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@ai-app/eslint-config": "workspace:*",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.0"
+  }
+}
