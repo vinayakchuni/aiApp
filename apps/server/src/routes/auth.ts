@@ -108,6 +108,23 @@ authRouter.post('/login', async (req, res) => {
   });
 });
 
+authRouter.post('/logout', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const sessionId = req.cookies?.session_id;
+
+  await prisma.session.delete({
+    where: { id: sessionId },
+  });
+
+  res.clearCookie('session_id', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
 authRouter.get('/me', requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({
     success: true,
