@@ -2,42 +2,30 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { validatePassword, validateEmail } from '@ai-app/shared';
+import { useSearchParams } from 'next/navigation';
 
-export default function RegisterPage() {
+export default function LoginPage() {
+  const searchParams = useSearchParams();
+  const redirect = searchParams.get('redirect') || '/';
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [errors, setErrors] = useState<string[]>([]);
+  const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const validationErrors: string[] = [];
 
-    if (!validateEmail(email)) {
-      validationErrors.push('Please enter a valid email address');
-    }
-
-    const passwordResult = validatePassword(password);
-    if (!passwordResult.valid) {
-      validationErrors.push(...passwordResult.errors);
-    }
-
-    if (password !== confirmPassword) {
-      validationErrors.push('Passwords do not match');
-    }
-
-    if (validationErrors.length > 0) {
-      setErrors(validationErrors);
+    if (!email || !password) {
+      setError('Please enter your email and password');
       return;
     }
 
-    setErrors([]);
+    setError('');
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/register`, {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -47,13 +35,13 @@ export default function RegisterPage() {
       const data = await res.json();
 
       if (!res.ok) {
-        setErrors(data.errors || [data.error || 'Registration failed']);
+        setError(data.error || 'Login failed');
         return;
       }
 
-      window.location.href = '/verify-email';
+      window.location.href = redirect;
     } catch {
-      setErrors(['Network error. Please try again.']);
+      setError('Network error. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -63,23 +51,19 @@ export default function RegisterPage() {
     <div className="flex min-h-screen items-center justify-center px-4">
       <div className="w-full max-w-md space-y-8">
         <div className="text-center">
-          <h1 className="text-3xl font-bold tracking-tight text-gray-900">Create an account</h1>
+          <h1 className="text-3xl font-bold tracking-tight text-gray-900">Sign in to your account</h1>
           <p className="mt-2 text-sm text-gray-600">
-            Already have an account?{' '}
-            <Link href="/login" className="font-medium text-blue-600 hover:text-blue-500">
-              Sign in
+            Don&apos;t have an account?{' '}
+            <Link href="/register" className="font-medium text-blue-600 hover:text-blue-500">
+              Create one
             </Link>
           </p>
         </div>
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-6">
-          {errors.length > 0 && (
+          {error && (
             <div className="rounded-md bg-red-50 p-4">
-              <ul className="list-disc space-y-1 pl-5 text-sm text-red-700">
-                {errors.map((error, i) => (
-                  <li key={i}>{error}</li>
-                ))}
-              </ul>
+              <p className="text-sm text-red-700">{error}</p>
             </div>
           )}
 
@@ -107,30 +91,20 @@ export default function RegisterPage() {
               <input
                 id="password"
                 type="password"
-                autoComplete="new-password"
+                autoComplete="current-password"
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                placeholder="Min 8 chars, 1 number, 1 special"
+                placeholder="Enter your password"
               />
             </div>
+          </div>
 
-            <div>
-              <label htmlFor="confirmPassword" className="block text-sm font-medium text-gray-700">
-                Confirm password
-              </label>
-              <input
-                id="confirmPassword"
-                type="password"
-                autoComplete="new-password"
-                required
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                placeholder="Re-enter your password"
-              />
-            </div>
+          <div className="flex items-center justify-end">
+            <Link href="/forgot-password" className="text-sm font-medium text-blue-600 hover:text-blue-500">
+              Forgot password?
+            </Link>
           </div>
 
           <button
@@ -148,10 +122,10 @@ export default function RegisterPage() {
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                Creating account...
+                Signing in...
               </span>
             ) : (
-              'Create account'
+              'Sign in'
             )}
           </button>
         </form>

@@ -14,6 +14,7 @@
     "@ai-app/shared": "workspace:*",
     "@prisma/client": "^6.19.3",
     "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@ai-app/eslint-config": "workspace:*",
     "@types/bcrypt": "^6.0.0",
+    "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.3",
