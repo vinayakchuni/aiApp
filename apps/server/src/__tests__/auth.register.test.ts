@@ -9,6 +9,10 @@ vi.mock('../lib/db', () => ({
       findUnique: vi.fn(),
       create: vi.fn(),
     },
+    verificationToken: {
+      deleteMany: vi.fn(),
+      create: vi.fn(),
+    },
   },
 }));
 
@@ -19,9 +23,21 @@ vi.mock('bcrypt', () => ({
   },
 }));
 
+vi.mock('../services/email', () => ({
+  sendVerificationEmail: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('crypto', () => ({
+  randomBytes: vi.fn().mockReturnValue({
+    toString: vi.fn().mockReturnValue('mock-verification-token'),
+  }),
+}));
+
 import { prisma } from '../lib/db';
+import { sendVerificationEmail } from '../services/email';
 
 const mockedPrisma = vi.mocked(prisma);
+const mockedSendVerificationEmail = vi.mocked(sendVerificationEmail);
 
 describe('POST /api/auth/register', () => {
   beforeEach(() => {
@@ -84,6 +100,15 @@ describe('POST /api/auth/register', () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    mockedPrisma.verificationToken.deleteMany.mockResolvedValue({ count: 0 });
+    mockedPrisma.verificationToken.create.mockResolvedValue({
+      id: 'token-id',
+      userId: 'uuid-123',
+      token: 'mock-verification-token',
+      type: 'EMAIL_VERIFICATION',
+      expiresAt: new Date(),
+      createdAt: new Date(),
+    });
 
     const res = await request(app)
       .post('/api/auth/register')
@@ -92,6 +117,42 @@ describe('POST /api/auth/register', () => {
     expect(res.status).toBe(201);
     expect(res.body.success).toBe(true);
     expect(res.body.message).toBeDefined();
+  });
+
+  it('generates verification token and sends email after user creation', async () => {
+    mockedPrisma.user.findUnique.mockResolvedValue(null);
+    mockedPrisma.user.create.mockResolvedValue({
+      id: 'uuid-123',
+      email: 'new@example.com',
+      passwordHash: 'hashed_password',
+      emailVerified: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    mockedPrisma.verificationToken.deleteMany.mockResolvedValue({ count: 0 });
+    mockedPrisma.verificationToken.create.mockResolvedValue({
+      id: 'token-id',
+      userId: 'uuid-123',
+      token: 'mock-verification-token',
+      type: 'EMAIL_VERIFICATION',
+      expiresAt: new Date(),
+      createdAt: new Date(),
+    });
+
+    await request(app)
+      .post('/api/auth/register')
+      .send({ email: 'new@example.com', password: 'ValidPass1!' });
+
+    expect(mockedPrisma.verificationToken.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: 'uuid-123',
+        type: 'EMAIL_VERIFICATION',
+      }),
+    });
+    expect(mockedSendVerificationEmail).toHaveBeenCalledWith({
+      email: 'new@example.com',
+      token: 'mock-verification-token',
+    });
   });
 
   it('stores email in lowercase', async () => {
@@ -103,6 +164,15 @@ describe('POST /api/auth/register', () => {
       emailVerified: false,
       createdAt: new Date(),
       updatedAt: new Date(),
+    });
+    mockedPrisma.verificationToken.deleteMany.mockResolvedValue({ count: 0 });
+    mockedPrisma.verificationToken.create.mockResolvedValue({
+      id: 'token-id',
+      userId: 'uuid-123',
+      token: 'mock-verification-token',
+      type: 'EMAIL_VERIFICATION',
+      expiresAt: new Date(),
+      createdAt: new Date(),
     });
 
     await request(app)
@@ -126,6 +196,15 @@ describe('POST /api/auth/register', () => {
       emailVerified: false,
       createdAt: new Date(),
       updatedAt: new Date(),
+    });
+    mockedPrisma.verificationToken.deleteMany.mockResolvedValue({ count: 0 });
+    mockedPrisma.verificationToken.create.mockResolvedValue({
+      id: 'token-id',
+      userId: 'uuid-123',
+      token: 'mock-verification-token',
+      type: 'EMAIL_VERIFICATION',
+      expiresAt: new Date(),
+      createdAt: new Date(),
     });
 
     await request(app)

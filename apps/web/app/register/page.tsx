@@ -51,7 +51,7 @@ export default function RegisterPage() {
         return;
       }
 
-      window.location.href = '/verify-email';
+      window.location.href = `/verify-email?email=${encodeURIComponent(email)}`;
     } catch {
       setErrors(['Network error. Please try again.']);
     } finally {

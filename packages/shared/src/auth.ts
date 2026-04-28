@@ -21,6 +21,17 @@ export interface ForgotPasswordRequest {
 export interface AuthResponse {
   success: boolean;
   message?: string;
+  error?: string;
+}
+
+export interface ResendVerificationRequest {
+  email: string;
+}
+
+export interface VerifyEmailResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
 }
 
 export interface UserResponse {

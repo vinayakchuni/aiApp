@@ -12,6 +12,7 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -36,6 +37,9 @@ export default function LoginPage() {
 
       if (!res.ok) {
         setError(data.error || 'Login failed');
+        if (res.status === 403 && data.email) {
+          setUnverifiedEmail(data.email);
+        }
         return;
       }
 
@@ -64,6 +68,14 @@ export default function LoginPage() {
           {error && (
             <div className="rounded-md bg-red-50 p-4">
               <p className="text-sm text-red-700">{error}</p>
+              {unverifiedEmail && (
+                <Link
+                  href={`/verify-email?email=${encodeURIComponent(unverifiedEmail)}`}
+                  className="mt-2 inline-block text-sm font-medium text-blue-600 hover:text-blue-500"
+                >
+                  Resend verification email
+                </Link>
+              )}
             </div>
           )}
 

@@ -3,6 +3,8 @@ import bcrypt from 'bcrypt';
 import { validatePassword, validateEmail } from '@ai-app/shared';
 import { prisma } from '../lib/db';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth';
+import { generateVerificationToken, validateToken, consumeToken } from '../services/token';
+import { sendVerificationEmail } from '../services/email';
 
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -40,12 +42,20 @@ authRouter.post('/register', async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 12);
 
   // Create user
-  await prisma.user.create({
+  const user = await prisma.user.create({
     data: {
       email: normalizedEmail,
       passwordHash,
     },
   });
+
+  // Generate verification token and send email
+  const token = await generateVerificationToken({
+    userId: user.id,
+    type: 'EMAIL_VERIFICATION',
+  });
+
+  await sendVerificationEmail({ email: user.email, token });
 
   res.status(201).json({ success: true, message: 'Registration successful. Please verify your email.' });
 });
@@ -76,7 +86,11 @@ authRouter.post('/login', async (req, res) => {
   }
 
   if (!user.emailVerified) {
-    res.status(403).json({ success: false, error: 'Please verify your email before logging in' });
+    res.status(403).json({
+      success: false,
+      error: 'Please verify your email before logging in',
+      email: user.email,
+    });
     return;
   }
 
@@ -135,4 +149,65 @@ authRouter.get('/me', requireAuth, (req: AuthenticatedRequest, res) => {
       createdAt: req.user!.createdAt.toISOString(),
     },
   });
+});
+
+authRouter.get('/verify-email', async (req, res) => {
+  const { token } = req.query;
+
+  if (!token || typeof token !== 'string') {
+    res.status(400).json({ success: false, error: 'Verification token is required' });
+    return;
+  }
+
+  const tokenRecord = await validateToken({ token, type: 'EMAIL_VERIFICATION' });
+
+  if (!tokenRecord) {
+    // Check if token exists but is expired
+    const existingToken = await prisma.verificationToken.findUnique({ where: { token } });
+    if (existingToken && existingToken.expiresAt < new Date()) {
+      res.status(400).json({ success: false, error: 'Verification link has expired. Please request a new one.' });
+      return;
+    }
+    res.status(400).json({ success: false, error: 'Verification link is invalid or has expired' });
+    return;
+  }
+
+  await prisma.user.update({
+    where: { id: tokenRecord.userId },
+    data: { emailVerified: true },
+  });
+
+  await consumeToken(tokenRecord.id);
+
+  res.json({ success: true, message: 'Email verified successfully' });
+});
+
+authRouter.post('/resend-verification', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email || !validateEmail(email)) {
+    res.status(400).json({ success: false, error: 'Valid email is required' });
+    return;
+  }
+
+  const normalizedEmail = email.toLowerCase();
+
+  const user = await prisma.user.findUnique({
+    where: { email: normalizedEmail },
+  });
+
+  // Always return success to prevent email enumeration
+  if (!user || user.emailVerified) {
+    res.json({ success: true, message: 'If an account exists with that email, a verification link has been sent.' });
+    return;
+  }
+
+  const token = await generateVerificationToken({
+    userId: user.id,
+    type: 'EMAIL_VERIFICATION',
+  });
+
+  await sendVerificationEmail({ email: user.email, token });
+
+  res.json({ success: true, message: 'If an account exists with that email, a verification link has been sent.' });
 });
