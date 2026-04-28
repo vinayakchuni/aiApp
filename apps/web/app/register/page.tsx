@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { validatePassword, validateEmail } from '@ai-app/shared';
+import { apiPost, isRateLimited, RATE_LIMIT_MESSAGE } from '../../lib/api';
 
 export default function RegisterPage() {
   const [email, setEmail] = useState('');
@@ -37,14 +38,13 @@ export default function RegisterPage() {
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ email, password }),
-      });
-
+      const res = await apiPost('/api/auth/register', { email, password });
       const data = await res.json();
+
+      if (isRateLimited(res.status)) {
+        setErrors([RATE_LIMIT_MESSAGE]);
+        return;
+      }
 
       if (!res.ok) {
         setErrors(data.errors || [data.error || 'Registration failed']);

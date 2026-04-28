@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
+import { apiPost, isRateLimited, RATE_LIMIT_MESSAGE } from '../../lib/api';
 
 type VerifyState = 'check-email' | 'verifying' | 'success' | 'error' | 'expired';
 
@@ -52,15 +53,12 @@ export default function VerifyEmailPage() {
 
     setResendLoading(true);
     try {
-      const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/resend-verification`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({ email: resendEmail }),
-        },
-      );
+      const res = await apiPost('/api/auth/resend-verification', { email: resendEmail });
+
+      if (isRateLimited(res.status)) {
+        setError(RATE_LIMIT_MESSAGE);
+        return;
+      }
 
       if (res.ok) {
         setResendSent(true);

@@ -4,6 +4,7 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { validatePassword } from '@ai-app/shared';
+import { apiPost, isRateLimited, RATE_LIMIT_MESSAGE } from '../../lib/api';
 
 export default function ResetPasswordPage() {
   const searchParams = useSearchParams();
@@ -59,13 +60,13 @@ export default function ResetPasswordPage() {
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/reset-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, password }),
-      });
-
+      const res = await apiPost('/api/auth/reset-password', { token, password });
       const data = await res.json();
+
+      if (isRateLimited(res.status)) {
+        setServerError(RATE_LIMIT_MESSAGE);
+        return;
+      }
 
       if (!res.ok) {
         if (data.errors) {

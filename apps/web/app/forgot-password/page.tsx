@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { validateEmail } from '@ai-app/shared';
+import { apiPost, isRateLimited, RATE_LIMIT_MESSAGE } from '../../lib/api';
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState('');
@@ -22,13 +23,13 @@ export default function ForgotPasswordPage() {
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/forgot-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email }),
-      });
-
+      const res = await apiPost('/api/auth/forgot-password', { email });
       const data = await res.json();
+
+      if (isRateLimited(res.status)) {
+        setError(RATE_LIMIT_MESSAGE);
+        return;
+      }
 
       if (!res.ok) {
         setError(data.error || 'Something went wrong. Please try again.');

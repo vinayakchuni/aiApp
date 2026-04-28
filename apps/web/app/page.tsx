@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import type { UserResponse } from '@ai-app/shared';
+import { apiPost } from '../lib/api';
 
 export default function Home() {
   const [user, setUser] = useState<UserResponse | null>(null);
@@ -23,10 +24,7 @@ export default function Home() {
   async function handleLogout() {
     setIsLoggingOut(true);
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/logout`, {
-        method: 'POST',
-        credentials: 'include',
-      });
+      await apiPost('/api/auth/logout');
       window.location.href = '/login';
     } catch {
       setIsLoggingOut(false);

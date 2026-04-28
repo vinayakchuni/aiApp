@@ -2,6 +2,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../app';
 
+// Mock CSRF to passthrough
+vi.mock('../middleware/csrf', () => ({
+  csrfProtection: (_req: unknown, _res: unknown, next: () => void) => next(),
+  csrfTokenEndpoint: (_req: unknown, res: { json: (data: unknown) => void }) => res.json({ csrfToken: 'test' }),
+}));
+
+// Mock rate limiter to passthrough
+vi.mock('../middleware/rate-limit', () => ({
+  loginLimiter: (_req: unknown, _res: unknown, next: () => void) => next(),
+  registerLimiter: (_req: unknown, _res: unknown, next: () => void) => next(),
+  forgotPasswordLimiter: (_req: unknown, _res: unknown, next: () => void) => next(),
+  createRateLimiter: () => (_req: unknown, _res: unknown, next: () => void) => next(),
+}));
+
 // Mock the db module
 vi.mock('../lib/db', () => ({
   prisma: {

@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
+import { apiPost, isRateLimited, RATE_LIMIT_MESSAGE } from '../../lib/api';
 
 export default function LoginPage() {
   const searchParams = useSearchParams();
@@ -26,14 +27,13 @@ export default function LoginPage() {
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ email, password }),
-      });
-
+      const res = await apiPost('/api/auth/login', { email, password });
       const data = await res.json();
+
+      if (isRateLimited(res.status)) {
+        setError(RATE_LIMIT_MESSAGE);
+        return;
+      }
 
       if (!res.ok) {
         setError(data.error || 'Login failed');

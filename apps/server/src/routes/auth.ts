@@ -5,12 +5,16 @@ import { prisma } from '../lib/db';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth';
 import { generateVerificationToken, validateToken, consumeToken } from '../services/token';
 import { sendVerificationEmail, sendPasswordResetEmail } from '../services/email';
+import { loginLimiter, registerLimiter, forgotPasswordLimiter } from '../middleware/rate-limit';
+import { csrfProtection, csrfTokenEndpoint } from '../middleware/csrf';
 
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export const authRouter: RouterType = Router();
 
-authRouter.post('/register', async (req, res) => {
+authRouter.get('/csrf-token', csrfTokenEndpoint);
+
+authRouter.post('/register', registerLimiter, csrfProtection, async (req, res) => {
   const { email, password } = req.body;
 
   // Validate email
@@ -60,7 +64,7 @@ authRouter.post('/register', async (req, res) => {
   res.status(201).json({ success: true, message: 'Registration successful. Please verify your email.' });
 });
 
-authRouter.post('/login', async (req, res) => {
+authRouter.post('/login', loginLimiter, csrfProtection, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -122,7 +126,7 @@ authRouter.post('/login', async (req, res) => {
   });
 });
 
-authRouter.post('/logout', requireAuth, async (req: AuthenticatedRequest, res) => {
+authRouter.post('/logout', csrfProtection, requireAuth, async (req: AuthenticatedRequest, res) => {
   const sessionId = req.cookies?.session_id;
 
   await prisma.session.delete({
@@ -182,7 +186,7 @@ authRouter.get('/verify-email', async (req, res) => {
   res.json({ success: true, message: 'Email verified successfully' });
 });
 
-authRouter.post('/forgot-password', async (req, res) => {
+authRouter.post('/forgot-password', forgotPasswordLimiter, csrfProtection, async (req, res) => {
   const { email } = req.body;
 
   if (!email || !validateEmail(email)) {
@@ -212,7 +216,7 @@ authRouter.post('/forgot-password', async (req, res) => {
   res.json({ success: true, message: 'If an account exists with that email, a password reset link has been sent.' });
 });
 
-authRouter.post('/reset-password', async (req, res) => {
+authRouter.post('/reset-password', csrfProtection, async (req, res) => {
   const { token, password } = req.body;
 
   if (!token) {
@@ -261,7 +265,7 @@ authRouter.post('/reset-password', async (req, res) => {
   res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
 });
 
-authRouter.post('/resend-verification', async (req, res) => {
+authRouter.post('/resend-verification', csrfProtection, async (req, res) => {
   const { email } = req.body;
 
   if (!email || !validateEmail(email)) {
