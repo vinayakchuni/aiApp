@@ -12,14 +12,21 @@
   },
   "dependencies": {
     "@ai-app/shared": "workspace:*",
+    "@prisma/client": "^6.19.3",
+    "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "prisma": "^6.19.3"
   },
   "devDependencies": {
     "@ai-app/eslint-config": "workspace:*",
+    "@types/bcrypt": "^6.0.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.3",
+    "@types/supertest": "^7.2.0",
+    "supertest": "^7.2.2",
     "tsx": "^4.19.0",
     "typescript": "^5.8.3",
     "vitest": "^3.1.0"

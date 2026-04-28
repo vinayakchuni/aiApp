@@ -17,6 +17,6 @@
   },
   "packageManager": "pnpm@10.33.2",
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "sharp"]
+    "onlyBuiltDependencies": ["esbuild", "sharp", "@prisma/engines", "prisma", "bcrypt"]
   }
 }
