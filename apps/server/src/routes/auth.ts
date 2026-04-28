@@ -4,7 +4,7 @@ import { validatePassword, validateEmail } from '@ai-app/shared';
 import { prisma } from '../lib/db';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth';
 import { generateVerificationToken, validateToken, consumeToken } from '../services/token';
-import { sendVerificationEmail } from '../services/email';
+import { sendVerificationEmail, sendPasswordResetEmail } from '../services/email';
 
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -180,6 +180,85 @@ authRouter.get('/verify-email', async (req, res) => {
   await consumeToken(tokenRecord.id);
 
   res.json({ success: true, message: 'Email verified successfully' });
+});
+
+authRouter.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email || !validateEmail(email)) {
+    res.status(400).json({ success: false, error: 'Valid email is required' });
+    return;
+  }
+
+  const normalizedEmail = email.toLowerCase();
+
+  const user = await prisma.user.findUnique({
+    where: { email: normalizedEmail },
+  });
+
+  // Always return success to prevent email enumeration
+  if (!user) {
+    res.json({ success: true, message: 'If an account exists with that email, a password reset link has been sent.' });
+    return;
+  }
+
+  const token = await generateVerificationToken({
+    userId: user.id,
+    type: 'PASSWORD_RESET',
+  });
+
+  await sendPasswordResetEmail({ email: user.email, token });
+
+  res.json({ success: true, message: 'If an account exists with that email, a password reset link has been sent.' });
+});
+
+authRouter.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+
+  if (!token) {
+    res.status(400).json({ success: false, error: 'Reset token is required' });
+    return;
+  }
+
+  if (!password) {
+    res.status(400).json({ success: false, error: 'Password is required' });
+    return;
+  }
+
+  const passwordValidation = validatePassword(password);
+  if (!passwordValidation.valid) {
+    res.status(400).json({ success: false, errors: passwordValidation.errors });
+    return;
+  }
+
+  const tokenRecord = await validateToken({ token, type: 'PASSWORD_RESET' });
+
+  if (!tokenRecord) {
+    // Check if token exists but is expired
+    const existingToken = await prisma.verificationToken.findUnique({ where: { token } });
+    if (existingToken && existingToken.type === 'PASSWORD_RESET' && existingToken.expiresAt < new Date()) {
+      res.status(400).json({ success: false, error: 'Reset link has expired. Please request a new one.' });
+      return;
+    }
+    res.status(400).json({ success: false, error: 'Reset link is invalid or has expired' });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+
+  await prisma.user.update({
+    where: { id: tokenRecord.userId },
+    data: { passwordHash },
+  });
+
+  // Invalidate all sessions for this user
+  await prisma.session.deleteMany({
+    where: { userId: tokenRecord.userId },
+  });
+
+  await consumeToken(tokenRecord.id);
+
+  res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
 });
 
 authRouter.post('/resend-verification', async (req, res) => {
