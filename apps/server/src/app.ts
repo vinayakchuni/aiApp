@@ -3,6 +3,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import type { ApiResponse, HealthCheck } from '@ai-app/shared';
 import { authRouter } from './routes/auth';
+import { conversationsRouter } from './routes/conversations';
 
 const app: Express = express();
 
@@ -25,5 +26,6 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/auth', authRouter);
+app.use('/api/conversations', conversationsRouter);
 
 export { app };

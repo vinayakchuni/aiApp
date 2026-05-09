@@ -27,6 +27,13 @@ export async function apiPost(path: string, body?: Record<string, unknown>): Pro
   });
 }
 
+export async function apiGet(path: string): Promise<Response> {
+  return fetch(`${API_URL}${path}`, {
+    method: 'GET',
+    credentials: 'include',
+  });
+}
+
 export function isRateLimited(status: number): boolean {
   return status === 429;
 }
