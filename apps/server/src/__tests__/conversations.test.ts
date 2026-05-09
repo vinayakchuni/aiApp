@@ -26,13 +26,22 @@ vi.mock('../lib/db', () => ({
       findUnique: vi.fn(),
       update: vi.fn(),
     },
-    message: { create: vi.fn() },
+    message: { create: vi.fn(), findMany: vi.fn() },
   },
 }));
 
+vi.mock('../services/ai', () => ({
+  defaultModel: vi.fn(() => 'mock-model'),
+  streamAssistantText: vi.fn(),
+  generateAssistantText: vi.fn(),
+}));
+
 import { prisma } from '../lib/db';
+import { streamAssistantText, generateAssistantText } from '../services/ai';
 
 const mockedPrisma = vi.mocked(prisma);
+const mockedStream = vi.mocked(streamAssistantText);
+const mockedGenerate = vi.mocked(generateAssistantText);
 const USER_ID = 'user-1';
 const OTHER_USER_ID = 'user-2';
 
@@ -52,6 +61,30 @@ function authedSession() {
       passwordHash: 'hash',
     },
   } as never);
+}
+
+function chunksOf(...chunks: string[]) {
+  return {
+    textStream: (async function* () {
+      for (const c of chunks) yield c;
+    })(),
+  };
+}
+
+function parseSseEvents(body: string) {
+  const events: { event: string; data: unknown }[] = [];
+  for (const block of body.split('\n\n')) {
+    if (!block.trim()) continue;
+    let event = 'message';
+    const dataLines: string[] = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (dataLines.length === 0) continue;
+    events.push({ event, data: JSON.parse(dataLines.join('\n')) });
+  }
+  return events;
 }
 
 describe('Conversations API', () => {
@@ -212,44 +245,6 @@ describe('Conversations API', () => {
   });
 
   describe('POST /api/conversations/:id/messages', () => {
-    it('saves user and echo assistant messages and returns both', async () => {
-      authedSession();
-      const now = new Date();
-      mockedPrisma.conversation.findUnique.mockResolvedValue({
-        id: 'conv-1',
-        userId: USER_ID,
-      } as never);
-      mockedPrisma.message.create
-        .mockResolvedValueOnce({
-          id: 'm1',
-          conversationId: 'conv-1',
-          role: 'user',
-          content: 'hello',
-          createdAt: now,
-        } as never)
-        .mockResolvedValueOnce({
-          id: 'm2',
-          conversationId: 'conv-1',
-          role: 'assistant',
-          content: 'hello',
-          createdAt: now,
-        } as never);
-      mockedPrisma.conversation.update.mockResolvedValue({} as never);
-
-      const res = await request(app)
-        .post('/api/conversations/conv-1/messages')
-        .set('Cookie', 'session_id=session-1')
-        .send({ content: 'hello' });
-
-      expect(res.status).toBe(201);
-      expect(res.body.success).toBe(true);
-      expect(res.body.userMessage.role).toBe('user');
-      expect(res.body.userMessage.content).toBe('hello');
-      expect(res.body.assistantMessage.role).toBe('assistant');
-      expect(res.body.assistantMessage.content).toBe('hello');
-      expect(mockedPrisma.message.create).toHaveBeenCalledTimes(2);
-    });
-
     it('returns 400 if content is missing or empty', async () => {
       authedSession();
 
@@ -276,6 +271,230 @@ describe('Conversations API', () => {
 
       expect(res.status).toBe(404);
       expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+    });
+
+    describe('non-streaming (?stream=false)', () => {
+      it('persists user message, calls generateAssistantText with full history, and returns JSON', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        const userMsg = {
+          id: 'm-user',
+          conversationId: 'conv-1',
+          role: 'user',
+          content: 'hello',
+          createdAt: now,
+        };
+        const assistantMsg = {
+          id: 'm-asst',
+          conversationId: 'conv-1',
+          role: 'assistant',
+          content: 'Hi there!',
+          createdAt: now,
+        };
+        mockedPrisma.message.create
+          .mockResolvedValueOnce(userMsg as never)
+          .mockResolvedValueOnce(assistantMsg as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'hello' },
+        ] as never);
+        mockedPrisma.conversation.update.mockResolvedValue({} as never);
+        mockedGenerate.mockResolvedValue('Hi there!');
+
+        const res = await request(app)
+          .post('/api/conversations/conv-1/messages?stream=false')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'hello' });
+
+        expect(res.status).toBe(201);
+        expect(res.body.success).toBe(true);
+        expect(res.body.userMessage.id).toBe('m-user');
+        expect(res.body.assistantMessage.id).toBe('m-asst');
+        expect(res.body.assistantMessage.content).toBe('Hi there!');
+        expect(mockedGenerate).toHaveBeenCalledWith([
+          { role: 'system', content: expect.any(String) },
+          { role: 'user', content: 'hello' },
+        ]);
+        expect(mockedStream).not.toHaveBeenCalled();
+        expect(mockedPrisma.message.create).toHaveBeenCalledTimes(2);
+      });
+
+      it('returns 502 if the AI provider throws', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        mockedPrisma.message.create.mockResolvedValueOnce({
+          id: 'm-user',
+          conversationId: 'conv-1',
+          role: 'user',
+          content: 'hello',
+          createdAt: now,
+        } as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'hello' },
+        ] as never);
+        mockedGenerate.mockRejectedValue(new Error('rate limited'));
+
+        const res = await request(app)
+          .post('/api/conversations/conv-1/messages?stream=false')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'hello' });
+
+        expect(res.status).toBe(502);
+        // user message is persisted, assistant is not
+        expect(mockedPrisma.message.create).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('streaming (default)', () => {
+      it('streams chunks via SSE and persists assistant message on done', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        const userMsg = {
+          id: 'm-user',
+          conversationId: 'conv-1',
+          role: 'user',
+          content: 'hello',
+          createdAt: now,
+        };
+        const assistantMsg = {
+          id: 'm-asst',
+          conversationId: 'conv-1',
+          role: 'assistant',
+          content: 'Hi there!',
+          createdAt: now,
+        };
+        mockedPrisma.message.create
+          .mockResolvedValueOnce(userMsg as never)
+          .mockResolvedValueOnce(assistantMsg as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'hello' },
+        ] as never);
+        mockedPrisma.conversation.update.mockResolvedValue({} as never);
+        mockedStream.mockReturnValue(chunksOf('Hi ', 'there!'));
+
+        const res = await request(app)
+          .post('/api/conversations/conv-1/messages')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'hello' });
+
+        expect(res.status).toBe(200);
+        expect(res.headers['content-type']).toContain('text/event-stream');
+        const events = parseSseEvents(res.text);
+        const types = events.map((e) => e.event);
+        expect(types).toEqual(['user-message', 'chunk', 'chunk', 'done']);
+
+        const userEvt = events[0].data as { userMessage: { id: string } };
+        expect(userEvt.userMessage.id).toBe('m-user');
+
+        const chunkTexts = events
+          .filter((e) => e.event === 'chunk')
+          .map((e) => (e.data as { text: string }).text);
+        expect(chunkTexts.join('')).toBe('Hi there!');
+
+        const doneEvt = events[3].data as { assistantMessage: { content: string } };
+        expect(doneEvt.assistantMessage.content).toBe('Hi there!');
+
+        // assistant message persisted with the concatenated stream text
+        expect(mockedPrisma.message.create).toHaveBeenNthCalledWith(2, {
+          data: { conversationId: 'conv-1', role: 'assistant', content: 'Hi there!' },
+        });
+      });
+
+      it('emits an SSE error event when the AI stream fails and does not persist assistant message', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        mockedPrisma.message.create.mockResolvedValueOnce({
+          id: 'm-user',
+          conversationId: 'conv-1',
+          role: 'user',
+          content: 'hello',
+          createdAt: now,
+        } as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'hello' },
+        ] as never);
+        mockedStream.mockReturnValue({
+          textStream: (async function* () {
+            yield 'Hi ';
+            throw new Error('boom');
+          })(),
+        });
+
+        const res = await request(app)
+          .post('/api/conversations/conv-1/messages')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'hello' });
+
+        expect(res.headers['content-type']).toContain('text/event-stream');
+        const events = parseSseEvents(res.text);
+        const types = events.map((e) => e.event);
+        expect(types).toContain('error');
+        expect(types).not.toContain('done');
+        // only the user message was persisted
+        expect(mockedPrisma.message.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('passes prior history to the model so context is preserved', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        mockedPrisma.message.create
+          .mockResolvedValueOnce({
+            id: 'm-user-2',
+            conversationId: 'conv-1',
+            role: 'user',
+            content: 'and again',
+            createdAt: now,
+          } as never)
+          .mockResolvedValueOnce({
+            id: 'm-asst-2',
+            conversationId: 'conv-1',
+            role: 'assistant',
+            content: 'ok',
+            createdAt: now,
+          } as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'user', content: 'and again' },
+        ] as never);
+        mockedPrisma.conversation.update.mockResolvedValue({} as never);
+        mockedStream.mockReturnValue(chunksOf('ok'));
+
+        await request(app)
+          .post('/api/conversations/conv-1/messages')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'and again' });
+
+        expect(mockedStream).toHaveBeenCalledTimes(1);
+        const passed = mockedStream.mock.calls[0][0];
+        // system + 3 history messages (latest user already persisted before ctx build)
+        expect(passed).toHaveLength(4);
+        expect(passed[0].role).toBe('system');
+        expect(passed.slice(1)).toEqual([
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'user', content: 'and again' },
+        ]);
+      });
     });
   });
 });

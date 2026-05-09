@@ -33,7 +33,7 @@ export async function getConversationForUser(userId: string, conversationId: str
   return conversation;
 }
 
-export async function appendUserAndEchoMessages(
+export async function appendUserMessage(
   userId: string,
   conversationId: string,
   content: string,
@@ -55,6 +55,16 @@ export async function appendUserAndEchoMessages(
     },
   });
 
+  const history = await prisma.message.findMany({
+    where: { conversationId },
+    orderBy: { createdAt: 'asc' },
+    select: { role: true, content: true },
+  });
+
+  return { userMessage, history };
+}
+
+export async function appendAssistantMessage(conversationId: string, content: string) {
   const assistantMessage = await prisma.message.create({
     data: {
       conversationId,
@@ -68,5 +78,5 @@ export async function appendUserAndEchoMessages(
     data: { updatedAt: new Date() },
   });
 
-  return { userMessage, assistantMessage };
+  return assistantMessage;
 }

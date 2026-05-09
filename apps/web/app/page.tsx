@@ -7,7 +7,7 @@ import type {
   Message,
   UserResponse,
 } from '@ai-app/shared';
-import { apiGet, apiPost } from '../lib/api';
+import { apiGet, apiPost, readSseEvents } from '../lib/api';
 
 export default function Home() {
   const [user, setUser] = useState<UserResponse | null>(null);
@@ -17,6 +17,7 @@ export default function Home() {
     useState<ConversationWithMessages | null>(null);
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const [streamingId, setStreamingId] = useState<string | null>(null);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -59,9 +60,12 @@ export default function Home() {
       .catch(console.error);
   }, [activeId]);
 
+  const lastMessageContent =
+    activeConversation?.messages[activeConversation.messages.length - 1]?.content;
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeConversation?.messages.length]);
+  }, [activeConversation?.messages.length, lastMessageContent]);
 
   async function handleNewConversation() {
     const res = await apiPost('/api/conversations', {});
@@ -79,56 +83,114 @@ export default function Home() {
     if (!content || !activeId || isSending) return;
 
     setIsSending(true);
+    const ts = Date.now();
+    const optimisticUserId = `optimistic-user-${ts}`;
+    const streamingAssistantId = `streaming-assistant-${ts}`;
     const optimisticUserMessage: Message = {
-      id: `optimistic-${Date.now()}`,
+      id: optimisticUserId,
       conversationId: activeId,
       role: 'user',
       content,
       createdAt: new Date().toISOString(),
     };
+    const streamingAssistantMessage: Message = {
+      id: streamingAssistantId,
+      conversationId: activeId,
+      role: 'assistant',
+      content: '',
+      createdAt: new Date().toISOString(),
+    };
     setActiveConversation((prev) =>
-      prev ? { ...prev, messages: [...prev.messages, optimisticUserMessage] } : prev,
+      prev
+        ? {
+            ...prev,
+            messages: [...prev.messages, optimisticUserMessage, streamingAssistantMessage],
+          }
+        : prev,
     );
+    setStreamingId(streamingAssistantId);
     setDraft('');
+
+    const removeOptimistic = () =>
+      setActiveConversation((prev) =>
+        prev
+          ? {
+              ...prev,
+              messages: prev.messages.filter(
+                (m) => m.id !== optimisticUserId && m.id !== streamingAssistantId,
+              ),
+            }
+          : prev,
+      );
 
     try {
       const res = await apiPost(`/api/conversations/${activeId}/messages`, { content });
-      const data = await res.json();
-      if (data.success) {
-        setActiveConversation((prev) => {
-          if (!prev) return prev;
-          const withoutOptimistic = prev.messages.filter(
-            (m) => m.id !== optimisticUserMessage.id,
+
+      if (!res.ok) {
+        removeOptimistic();
+        return;
+      }
+
+      let receivedError = false;
+
+      for await (const evt of readSseEvents(res)) {
+        if (evt.event === 'user-message') {
+          const { userMessage } = evt.data as { userMessage: Message };
+          setActiveConversation((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  messages: prev.messages.map((m) =>
+                    m.id === optimisticUserId ? userMessage : m,
+                  ),
+                }
+              : prev,
           );
-          return {
-            ...prev,
-            messages: [...withoutOptimistic, data.userMessage, data.assistantMessage],
-          };
-        });
+        } else if (evt.event === 'chunk') {
+          const { text } = evt.data as { text: string };
+          setActiveConversation((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  messages: prev.messages.map((m) =>
+                    m.id === streamingAssistantId
+                      ? { ...m, content: m.content + text }
+                      : m,
+                  ),
+                }
+              : prev,
+          );
+        } else if (evt.event === 'done') {
+          const { assistantMessage } = evt.data as { assistantMessage: Message };
+          setActiveConversation((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  messages: prev.messages.map((m) =>
+                    m.id === streamingAssistantId ? assistantMessage : m,
+                  ),
+                }
+              : prev,
+          );
+        } else if (evt.event === 'error') {
+          receivedError = true;
+          removeOptimistic();
+        }
+      }
+
+      if (!receivedError) {
         setConversations((prev) => {
           const updated = prev.filter((c) => c.id !== activeId);
           const current = prev.find((c) => c.id === activeId);
           if (!current) return prev;
           return [{ ...current, updatedAt: new Date().toISOString() }, ...updated];
         });
-      } else {
-        setActiveConversation((prev) =>
-          prev
-            ? {
-                ...prev,
-                messages: prev.messages.filter((m) => m.id !== optimisticUserMessage.id),
-              }
-            : prev,
-        );
       }
     } catch (err) {
       console.error(err);
-      setActiveConversation((prev) =>
-        prev
-          ? { ...prev, messages: prev.messages.filter((m) => m.id !== optimisticUserMessage.id) }
-          : prev,
-      );
+      removeOptimistic();
     } finally {
+      setStreamingId(null);
       setIsSending(false);
     }
   }
@@ -208,22 +270,37 @@ export default function Home() {
                     Send a message to start the conversation.
                   </li>
                 ) : (
-                  activeConversation.messages.map((m) => (
-                    <li
-                      key={m.id}
-                      className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                    >
-                      <div
-                        className={`max-w-[80%] whitespace-pre-wrap rounded-lg px-4 py-2 text-sm ${
-                          m.role === 'user'
-                            ? 'bg-blue-600 text-white'
-                            : 'bg-white text-gray-900 shadow'
-                        }`}
+                  activeConversation.messages.map((m) => {
+                    const isStreaming = m.id === streamingId;
+                    const isEmptyStreaming = isStreaming && m.content.length === 0;
+                    return (
+                      <li
+                        key={m.id}
+                        className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
                       >
-                        {m.content}
-                      </div>
-                    </li>
-                  ))
+                        <div
+                          className={`max-w-[80%] whitespace-pre-wrap rounded-lg px-4 py-2 text-sm ${
+                            m.role === 'user'
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-white text-gray-900 shadow'
+                          }`}
+                        >
+                          {isEmptyStreaming ? (
+                            <span
+                              aria-label="Assistant is typing"
+                              className="inline-flex gap-1"
+                            >
+                              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.3s]" />
+                              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.15s]" />
+                              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400" />
+                            </span>
+                          ) : (
+                            m.content
+                          )}
+                        </div>
+                      </li>
+                    );
+                  })
                 )}
                 <div ref={messagesEndRef} />
               </ul>

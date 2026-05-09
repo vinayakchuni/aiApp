@@ -39,3 +39,39 @@ export function isRateLimited(status: number): boolean {
 }
 
 export const RATE_LIMIT_MESSAGE = 'Too many requests. Please wait a few minutes and try again.';
+
+export interface SseEvent<T = unknown> {
+  event: string;
+  data: T;
+}
+
+export async function* readSseEvents<T = unknown>(
+  response: Response,
+): AsyncGenerator<SseEvent<T>> {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf('\n\n');
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf('\n\n');
+
+      let event = 'message';
+      const dataLines: string[] = [];
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+      }
+      if (dataLines.length === 0) continue;
+      yield { event, data: JSON.parse(dataLines.join('\n')) as T };
+    }
+  }
+}
