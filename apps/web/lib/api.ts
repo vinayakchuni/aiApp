@@ -34,6 +34,32 @@ export async function apiGet(path: string): Promise<Response> {
   });
 }
 
+export async function apiPatch(path: string, body?: Record<string, unknown>): Promise<Response> {
+  const token = await fetchCsrfToken();
+
+  return fetch(`${API_URL}${path}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-csrf-token': token,
+    },
+    credentials: 'include',
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+export async function apiDelete(path: string): Promise<Response> {
+  const token = await fetchCsrfToken();
+
+  return fetch(`${API_URL}${path}`, {
+    method: 'DELETE',
+    headers: {
+      'x-csrf-token': token,
+    },
+    credentials: 'include',
+  });
+}
+
 export function isRateLimited(status: number): boolean {
   return status === 429;
 }

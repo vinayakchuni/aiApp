@@ -25,6 +25,7 @@ vi.mock('../lib/db', () => ({
       findMany: vi.fn(),
       findUnique: vi.fn(),
       update: vi.fn(),
+      delete: vi.fn(),
     },
     message: { create: vi.fn(), findMany: vi.fn() },
   },
@@ -241,6 +242,225 @@ describe('Conversations API', () => {
         .set('Cookie', 'session_id=session-1');
 
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe('PATCH /api/conversations/:id', () => {
+    it('rejects without session', async () => {
+      const res = await request(app)
+        .patch('/api/conversations/conv-1')
+        .send({ title: 'Renamed' });
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 400 when title is missing or empty', async () => {
+      authedSession();
+      const res = await request(app)
+        .patch('/api/conversations/conv-1')
+        .set('Cookie', 'session_id=session-1')
+        .send({ title: '   ' });
+      expect(res.status).toBe(400);
+      expect(mockedPrisma.conversation.update).not.toHaveBeenCalled();
+    });
+
+    it('renames an owned conversation', async () => {
+      authedSession();
+      const now = new Date();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+      } as never);
+      mockedPrisma.conversation.update.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+        title: 'Renamed',
+        createdAt: now,
+        updatedAt: now,
+      } as never);
+
+      const res = await request(app)
+        .patch('/api/conversations/conv-1')
+        .set('Cookie', 'session_id=session-1')
+        .send({ title: '  Renamed  ' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.conversation.title).toBe('Renamed');
+      expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: { title: 'Renamed' },
+      });
+    });
+
+    it("returns 404 for another user's conversation", async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-x',
+        userId: OTHER_USER_ID,
+      } as never);
+
+      const res = await request(app)
+        .patch('/api/conversations/conv-x')
+        .set('Cookie', 'session_id=session-1')
+        .send({ title: 'Hijack' });
+
+      expect(res.status).toBe(404);
+      expect(mockedPrisma.conversation.update).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when conversation does not exist', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue(null as never);
+
+      const res = await request(app)
+        .patch('/api/conversations/missing')
+        .set('Cookie', 'session_id=session-1')
+        .send({ title: 'Renamed' });
+
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /api/conversations/:id', () => {
+    it('rejects without session', async () => {
+      const res = await request(app).delete('/api/conversations/conv-1');
+      expect(res.status).toBe(401);
+    });
+
+    it('deletes an owned conversation', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+      } as never);
+      mockedPrisma.conversation.delete.mockResolvedValue({} as never);
+
+      const res = await request(app)
+        .delete('/api/conversations/conv-1')
+        .set('Cookie', 'session_id=session-1');
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(mockedPrisma.conversation.delete).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+      });
+    });
+
+    it("returns 404 for another user's conversation", async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-x',
+        userId: OTHER_USER_ID,
+      } as never);
+
+      const res = await request(app)
+        .delete('/api/conversations/conv-x')
+        .set('Cookie', 'session_id=session-1');
+
+      expect(res.status).toBe(404);
+      expect(mockedPrisma.conversation.delete).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when conversation does not exist', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue(null as never);
+
+      const res = await request(app)
+        .delete('/api/conversations/missing')
+        .set('Cookie', 'session_id=session-1');
+
+      expect(res.status).toBe(404);
+      expect(mockedPrisma.conversation.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Auto-title', () => {
+    it('sets title to the first user message (truncated) when title is the default', async () => {
+      authedSession();
+      const now = new Date();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+        title: 'New conversation',
+      } as never);
+      mockedPrisma.message.create.mockResolvedValueOnce({
+        id: 'm-user',
+        conversationId: 'conv-1',
+        role: 'user',
+        content: 'What is the capital of France and please tell me everything you know about it',
+        createdAt: now,
+      } as never);
+      mockedPrisma.message.create.mockResolvedValueOnce({
+        id: 'm-asst',
+        conversationId: 'conv-1',
+        role: 'assistant',
+        content: 'Paris',
+        createdAt: now,
+      } as never);
+      mockedPrisma.message.findMany.mockResolvedValue([
+        {
+          role: 'user',
+          content:
+            'What is the capital of France and please tell me everything you know about it',
+        },
+      ] as never);
+      mockedPrisma.conversation.update.mockResolvedValue({} as never);
+      mockedGenerate.mockResolvedValue('Paris');
+
+      await request(app)
+        .post('/api/conversations/conv-1/messages?stream=false')
+        .set('Cookie', 'session_id=session-1')
+        .send({
+          content:
+            'What is the capital of France and please tell me everything you know about it',
+        });
+
+      const titleCalls = mockedPrisma.conversation.update.mock.calls.filter(
+        (call) => (call[0] as { data?: { title?: string } })?.data?.title !== undefined,
+      );
+      expect(titleCalls).toHaveLength(1);
+      const updated = titleCalls[0][0] as { data: { title: string } };
+      expect(updated.data.title).toBe('What is the capital of France and please tell me e');
+      expect(updated.data.title.length).toBe(50);
+    });
+
+    it('does not change title when title has already been set', async () => {
+      authedSession();
+      const now = new Date();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+        title: 'My custom title',
+      } as never);
+      mockedPrisma.message.create.mockResolvedValueOnce({
+        id: 'm-user',
+        conversationId: 'conv-1',
+        role: 'user',
+        content: 'hello',
+        createdAt: now,
+      } as never);
+      mockedPrisma.message.create.mockResolvedValueOnce({
+        id: 'm-asst',
+        conversationId: 'conv-1',
+        role: 'assistant',
+        content: 'hi',
+        createdAt: now,
+      } as never);
+      mockedPrisma.message.findMany.mockResolvedValue([
+        { role: 'user', content: 'hello' },
+      ] as never);
+      mockedPrisma.conversation.update.mockResolvedValue({} as never);
+      mockedGenerate.mockResolvedValue('hi');
+
+      await request(app)
+        .post('/api/conversations/conv-1/messages?stream=false')
+        .set('Cookie', 'session_id=session-1')
+        .send({ content: 'hello' });
+
+      const titleCalls = mockedPrisma.conversation.update.mock.calls.filter(
+        (call) => (call[0] as { data?: { title?: string } })?.data?.title !== undefined,
+      );
+      expect(titleCalls).toHaveLength(0);
     });
   });
 

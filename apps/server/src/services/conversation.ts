@@ -1,5 +1,8 @@
 import { prisma } from '../lib/db';
 
+export const DEFAULT_CONVERSATION_TITLE = 'New conversation';
+export const AUTO_TITLE_MAX_LENGTH = 50;
+
 export async function createConversation(userId: string, title?: string) {
   return prisma.conversation.create({
     data: {
@@ -7,6 +10,40 @@ export async function createConversation(userId: string, title?: string) {
       ...(title ? { title } : {}),
     },
   });
+}
+
+export async function renameConversation(
+  userId: string,
+  conversationId: string,
+  title: string,
+) {
+  const conversation = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: { id: true, userId: true },
+  });
+
+  if (!conversation || conversation.userId !== userId) {
+    return null;
+  }
+
+  return prisma.conversation.update({
+    where: { id: conversationId },
+    data: { title },
+  });
+}
+
+export async function deleteConversation(userId: string, conversationId: string) {
+  const conversation = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: { id: true, userId: true },
+  });
+
+  if (!conversation || conversation.userId !== userId) {
+    return false;
+  }
+
+  await prisma.conversation.delete({ where: { id: conversationId } });
+  return true;
 }
 
 export async function listConversations(userId: string) {
@@ -40,7 +77,7 @@ export async function appendUserMessage(
 ) {
   const conversation = await prisma.conversation.findUnique({
     where: { id: conversationId },
-    select: { id: true, userId: true },
+    select: { id: true, userId: true, title: true },
   });
 
   if (!conversation || conversation.userId !== userId) {
@@ -54,6 +91,16 @@ export async function appendUserMessage(
       content,
     },
   });
+
+  if (conversation.title === DEFAULT_CONVERSATION_TITLE) {
+    const autoTitle = content.trim().slice(0, AUTO_TITLE_MAX_LENGTH);
+    if (autoTitle.length > 0) {
+      await prisma.conversation.update({
+        where: { id: conversationId },
+        data: { title: autoTitle },
+      });
+    }
+  }
 
   const history = await prisma.message.findMany({
     where: { conversationId },

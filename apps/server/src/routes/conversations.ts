@@ -7,6 +7,8 @@ import {
   getConversationForUser,
   appendUserMessage,
   appendAssistantMessage,
+  renameConversation,
+  deleteConversation,
 } from '../services/conversation';
 import { buildModelMessages } from '../services/context';
 import { streamAssistantText, generateAssistantText } from '../services/ai';
@@ -43,6 +45,47 @@ conversationsRouter.get('/:id', requireAuth, async (req: AuthenticatedRequest, r
 
   res.json({ success: true, conversation });
 });
+
+conversationsRouter.patch(
+  '/:id',
+  csrfProtection,
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const { title } = (req.body ?? {}) as { title?: string };
+
+    if (typeof title !== 'string' || title.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'Title is required' });
+      return;
+    }
+
+    const id = String(req.params.id);
+    const conversation = await renameConversation(req.user!.id, id, title.trim());
+
+    if (!conversation) {
+      res.status(404).json({ success: false, error: 'Conversation not found' });
+      return;
+    }
+
+    res.json({ success: true, conversation });
+  },
+);
+
+conversationsRouter.delete(
+  '/:id',
+  csrfProtection,
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const id = String(req.params.id);
+    const deleted = await deleteConversation(req.user!.id, id);
+
+    if (!deleted) {
+      res.status(404).json({ success: false, error: 'Conversation not found' });
+      return;
+    }
+
+    res.json({ success: true });
+  },
+);
 
 function writeSseEvent(res: import('express').Response, event: string, data: unknown) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);

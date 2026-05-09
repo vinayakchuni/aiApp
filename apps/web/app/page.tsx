@@ -7,7 +7,10 @@ import type {
   Message,
   UserResponse,
 } from '@ai-app/shared';
-import { apiGet, apiPost, readSseEvents } from '../lib/api';
+import { apiDelete, apiGet, apiPatch, apiPost, readSseEvents } from '../lib/api';
+
+const DEFAULT_CONVERSATION_TITLE = 'New conversation';
+const AUTO_TITLE_MAX_LENGTH = 50;
 
 export default function Home() {
   const [user, setUser] = useState<UserResponse | null>(null);
@@ -19,6 +22,8 @@ export default function Home() {
   const [isSending, setIsSending] = useState(false);
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState('');
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -183,8 +188,20 @@ export default function Home() {
           const updated = prev.filter((c) => c.id !== activeId);
           const current = prev.find((c) => c.id === activeId);
           if (!current) return prev;
-          return [{ ...current, updatedAt: new Date().toISOString() }, ...updated];
+          const nextTitle =
+            current.title === DEFAULT_CONVERSATION_TITLE
+              ? content.slice(0, AUTO_TITLE_MAX_LENGTH) || current.title
+              : current.title;
+          return [
+            { ...current, title: nextTitle, updatedAt: new Date().toISOString() },
+            ...updated,
+          ];
         });
+        setActiveConversation((prev) =>
+          prev && prev.title === DEFAULT_CONVERSATION_TITLE
+            ? { ...prev, title: content.slice(0, AUTO_TITLE_MAX_LENGTH) || prev.title }
+            : prev,
+        );
       }
     } catch (err) {
       console.error(err);
@@ -192,6 +209,64 @@ export default function Home() {
     } finally {
       setStreamingId(null);
       setIsSending(false);
+    }
+  }
+
+  function startEditing(conversation: Conversation) {
+    setEditingId(conversation.id);
+    setEditingTitle(conversation.title);
+  }
+
+  function cancelEditing() {
+    setEditingId(null);
+    setEditingTitle('');
+  }
+
+  async function commitRename(conversationId: string) {
+    const next = editingTitle.trim();
+    const current = conversations.find((c) => c.id === conversationId);
+    if (!next || !current || next === current.title) {
+      cancelEditing();
+      return;
+    }
+
+    const previousConversations = conversations;
+    setConversations((prev) =>
+      prev.map((c) => (c.id === conversationId ? { ...c, title: next } : c)),
+    );
+    setActiveConversation((prev) =>
+      prev && prev.id === conversationId ? { ...prev, title: next } : prev,
+    );
+    cancelEditing();
+
+    const res = await apiPatch(`/api/conversations/${conversationId}`, { title: next });
+    if (!res.ok) {
+      setConversations(previousConversations);
+      setActiveConversation((prev) =>
+        prev && prev.id === conversationId ? { ...prev, title: current.title } : prev,
+      );
+    }
+  }
+
+  async function handleDelete(conversation: Conversation) {
+    if (!window.confirm(`Delete "${conversation.title}"? This cannot be undone.`)) {
+      return;
+    }
+
+    const previousConversations = conversations;
+    const wasActive = activeId === conversation.id;
+    setConversations((prev) => prev.filter((c) => c.id !== conversation.id));
+    if (wasActive) {
+      setActiveId(null);
+      setActiveConversation(null);
+    }
+
+    const res = await apiDelete(`/api/conversations/${conversation.id}`);
+    if (!res.ok) {
+      setConversations(previousConversations);
+      if (wasActive) {
+        setActiveId(conversation.id);
+      }
     }
   }
 
@@ -224,17 +299,69 @@ export default function Home() {
             </li>
           ) : (
             conversations.map((c) => (
-              <li key={c.id}>
-                <button
-                  onClick={() => setActiveId(c.id)}
-                  className={`block w-full truncate px-4 py-3 text-left text-sm ${
-                    c.id === activeId
-                      ? 'bg-blue-50 font-medium text-blue-700'
-                      : 'text-gray-700 hover:bg-gray-50'
-                  }`}
-                >
-                  {c.title}
-                </button>
+              <li key={c.id} className="group relative">
+                {editingId === c.id ? (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void commitRename(c.id);
+                    }}
+                    className="px-3 py-2"
+                  >
+                    <input
+                      type="text"
+                      value={editingTitle}
+                      onChange={(e) => setEditingTitle(e.target.value)}
+                      onBlur={() => void commitRename(c.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          e.preventDefault();
+                          cancelEditing();
+                        }
+                      }}
+                      autoFocus
+                      maxLength={100}
+                      className="w-full rounded-md border border-blue-400 px-2 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                  </form>
+                ) : (
+                  <div
+                    className={`flex items-center ${
+                      c.id === activeId ? 'bg-blue-50' : 'hover:bg-gray-50'
+                    }`}
+                  >
+                    <button
+                      onClick={() => setActiveId(c.id)}
+                      className={`flex-1 truncate px-4 py-3 text-left text-sm ${
+                        c.id === activeId
+                          ? 'font-medium text-blue-700'
+                          : 'text-gray-700'
+                      }`}
+                    >
+                      {c.title}
+                    </button>
+                    <div className="flex items-center gap-1 pr-2 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                      <button
+                        type="button"
+                        onClick={() => startEditing(c)}
+                        aria-label={`Rename ${c.title}`}
+                        title="Rename"
+                        className="rounded p-1 text-xs text-gray-500 hover:bg-gray-200 hover:text-gray-900"
+                      >
+                        Rename
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleDelete(c)}
+                        aria-label={`Delete ${c.title}`}
+                        title="Delete"
+                        className="rounded p-1 text-xs text-gray-500 hover:bg-red-100 hover:text-red-700"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                )}
               </li>
             ))
           )}

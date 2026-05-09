@@ -24,6 +24,10 @@ export interface CreateConversationRequest {
   title?: string;
 }
 
+export interface UpdateConversationRequest {
+  title: string;
+}
+
 export interface SendMessageRequest {
   content: string;
 }
