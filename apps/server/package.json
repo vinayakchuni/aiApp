@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ai-app/shared": "workspace:*",
+    "@ai-sdk/anthropic": "^3.0.76",
     "@ai-sdk/openai": "^3.0.63",
     "@prisma/client": "^6.19.3",
     "ai": "^6.0.177",
@@ -21,6 +22,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "express-rate-limit": "^8.4.1",
+    "ollama-ai-provider-v2": "^3.5.0",
     "prisma": "^6.19.3",
     "resend": "^6.12.2"
   },

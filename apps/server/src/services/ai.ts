@@ -1,27 +1,31 @@
-import { openai } from '@ai-sdk/openai';
 import { generateText, streamText, type LanguageModel } from 'ai';
 import type { LLMMessage } from './context';
-
-const DEFAULT_MODEL_ID = 'gpt-4o-mini';
+import { DEFAULT_MODEL_ID, resolveModel } from './models';
 
 export function defaultModel(): LanguageModel {
-  return openai(DEFAULT_MODEL_ID);
+  return resolveModel(DEFAULT_MODEL_ID);
 }
 
 export interface AssistantTextStream {
   textStream: AsyncIterable<string>;
 }
 
-export function streamAssistantText(messages: LLMMessage[]): AssistantTextStream {
+export function streamAssistantText(
+  messages: LLMMessage[],
+  modelId: string = DEFAULT_MODEL_ID,
+): AssistantTextStream {
   return streamText({
-    model: defaultModel(),
+    model: resolveModel(modelId),
     messages,
   });
 }
 
-export async function generateAssistantText(messages: LLMMessage[]): Promise<string> {
+export async function generateAssistantText(
+  messages: LLMMessage[],
+  modelId: string = DEFAULT_MODEL_ID,
+): Promise<string> {
   const result = await generateText({
-    model: defaultModel(),
+    model: resolveModel(modelId),
     messages,
   });
   return result.text;

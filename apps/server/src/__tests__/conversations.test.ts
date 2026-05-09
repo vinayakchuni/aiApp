@@ -534,10 +534,13 @@ describe('Conversations API', () => {
         expect(res.body.userMessage.id).toBe('m-user');
         expect(res.body.assistantMessage.id).toBe('m-asst');
         expect(res.body.assistantMessage.content).toBe('Hi there!');
-        expect(mockedGenerate).toHaveBeenCalledWith([
-          { role: 'system', content: expect.any(String) },
-          { role: 'user', content: 'hello' },
-        ]);
+        expect(mockedGenerate).toHaveBeenCalledWith(
+          [
+            { role: 'system', content: expect.any(String) },
+            { role: 'user', content: 'hello' },
+          ],
+          expect.any(String),
+        );
         expect(mockedStream).not.toHaveBeenCalled();
         expect(mockedPrisma.message.create).toHaveBeenCalledTimes(2);
       });

@@ -12,6 +12,8 @@ import {
 } from '../services/conversation';
 import { buildModelMessages } from '../services/context';
 import { streamAssistantText, generateAssistantText } from '../services/ai';
+import { isSupportedModel, DEFAULT_MODEL_ID } from '../services/models';
+import { prisma } from '../lib/db';
 
 export const conversationsRouter: RouterType = Router();
 
@@ -113,11 +115,28 @@ conversationsRouter.post(
 
     const { userMessage, history } = result;
     const modelMessages = buildModelMessages({ history });
-    const wantsStream = req.query.stream !== 'false';
+
+    const userSettings = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { preferredModel: true, streamingEnabled: true },
+    });
+    const userModelId = userSettings?.preferredModel ?? DEFAULT_MODEL_ID;
+    const userStreamingDefault = userSettings?.streamingEnabled ?? true;
+
+    const modelOverride = typeof req.query.model === 'string' ? req.query.model : undefined;
+    if (modelOverride !== undefined && !isSupportedModel(modelOverride)) {
+      res.status(400).json({ success: false, error: 'Invalid model identifier' });
+      return;
+    }
+    const modelId = modelOverride ?? (isSupportedModel(userModelId) ? userModelId : DEFAULT_MODEL_ID);
+
+    const streamParam = req.query.stream;
+    const wantsStream =
+      streamParam === 'true' ? true : streamParam === 'false' ? false : userStreamingDefault;
 
     if (!wantsStream) {
       try {
-        const assistantText = await generateAssistantText(modelMessages);
+        const assistantText = await generateAssistantText(modelMessages, modelId);
         const assistantMessage = await appendAssistantMessage(id, assistantText);
         res.status(201).json({ success: true, userMessage, assistantMessage });
       } catch (err) {
@@ -136,7 +155,7 @@ conversationsRouter.post(
 
     let full = '';
     try {
-      const { textStream } = streamAssistantText(modelMessages);
+      const { textStream } = streamAssistantText(modelMessages, modelId);
       for await (const chunk of textStream) {
         full += chunk;
         writeSseEvent(res, 'chunk', { text: chunk });

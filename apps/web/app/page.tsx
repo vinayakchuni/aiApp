@@ -6,8 +6,10 @@ import type {
   ConversationWithMessages,
   Message,
   UserResponse,
+  UserSettingsResponse,
 } from '@ai-app/shared';
 import { apiDelete, apiGet, apiPatch, apiPost, readSseEvents } from '../lib/api';
+import { SettingsModal } from '../components/SettingsModal';
 
 const DEFAULT_CONVERSATION_TITLE = 'New conversation';
 const AUTO_TITLE_MAX_LENGTH = 50;
@@ -24,6 +26,8 @@ export default function Home() {
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState('');
+  const [settings, setSettings] = useState<UserSettingsResponse | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -31,6 +35,15 @@ export default function Home() {
       .then((res) => res.json())
       .then((data) => {
         if (data.success && data.user) setUser(data.user);
+      })
+      .catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    apiGet('/api/users/settings')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success) setSettings(data.settings as UserSettingsResponse);
       })
       .catch(console.error);
   }, []);
@@ -129,10 +142,53 @@ export default function Home() {
       );
 
     try {
-      const res = await apiPost(`/api/conversations/${activeId}/messages`, { content });
+      const useStream = settings?.streamingEnabled ?? true;
+      const url = useStream
+        ? `/api/conversations/${activeId}/messages?stream=true`
+        : `/api/conversations/${activeId}/messages?stream=false`;
+      const res = await apiPost(url, { content });
 
       if (!res.ok) {
         removeOptimistic();
+        return;
+      }
+
+      if (!useStream) {
+        const data = await res.json();
+        if (data.success) {
+          setActiveConversation((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  messages: prev.messages.map((m) => {
+                    if (m.id === optimisticUserId) return data.userMessage as Message;
+                    if (m.id === streamingAssistantId) return data.assistantMessage as Message;
+                    return m;
+                  }),
+                }
+              : prev,
+          );
+          setConversations((prev) => {
+            const updated = prev.filter((c) => c.id !== activeId);
+            const current = prev.find((c) => c.id === activeId);
+            if (!current) return prev;
+            const nextTitle =
+              current.title === DEFAULT_CONVERSATION_TITLE
+                ? content.slice(0, AUTO_TITLE_MAX_LENGTH) || current.title
+                : current.title;
+            return [
+              { ...current, title: nextTitle, updatedAt: new Date().toISOString() },
+              ...updated,
+            ];
+          });
+          setActiveConversation((prev) =>
+            prev && prev.title === DEFAULT_CONVERSATION_TITLE
+              ? { ...prev, title: content.slice(0, AUTO_TITLE_MAX_LENGTH) || prev.title }
+              : prev,
+          );
+        } else {
+          removeOptimistic();
+        }
         return;
       }
 
@@ -371,6 +427,13 @@ export default function Home() {
             <div className="space-y-2">
               <p className="truncate text-xs text-gray-600">{user.email}</p>
               <button
+                onClick={() => setIsSettingsOpen(true)}
+                disabled={!settings}
+                className="w-full rounded-md border border-gray-300 bg-white px-3 py-1.5 text-xs font-semibold text-gray-800 hover:bg-gray-50 disabled:opacity-50"
+              >
+                Settings
+              </button>
+              <button
                 onClick={handleLogout}
                 disabled={isLoggingOut}
                 className="w-full rounded-md bg-gray-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-gray-700 disabled:opacity-50"
@@ -387,8 +450,19 @@ export default function Home() {
       <section className="flex flex-1 flex-col">
         {activeConversation ? (
           <>
-            <header className="border-b border-gray-200 bg-white px-6 py-3">
+            <header className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-3">
               <h1 className="text-sm font-semibold text-gray-900">{activeConversation.title}</h1>
+              {settings ? (
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsOpen(true)}
+                  title="Change model or streaming preference"
+                  className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
+                >
+                  {settings.models.find((m) => m.id === settings.preferredModel)?.label ??
+                    settings.preferredModel}
+                </button>
+              ) : null}
             </header>
             <div className="flex-1 overflow-y-auto px-6 py-4">
               <ul className="mx-auto flex max-w-3xl flex-col gap-3">
@@ -469,6 +543,13 @@ export default function Home() {
           </div>
         )}
       </section>
+
+      <SettingsModal
+        open={isSettingsOpen}
+        settings={settings}
+        onClose={() => setIsSettingsOpen(false)}
+        onSaved={(s) => setSettings(s)}
+      />
     </main>
   );
 }
