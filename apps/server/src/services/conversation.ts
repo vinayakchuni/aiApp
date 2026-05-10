@@ -2,6 +2,22 @@ import { prisma } from '../lib/db';
 
 export const DEFAULT_CONVERSATION_TITLE = 'New conversation';
 export const AUTO_TITLE_MAX_LENGTH = 50;
+const DEFAULT_MAX_MESSAGES = 100;
+
+export function getMaxMessagesPerConversation(): number {
+  const raw = process.env.MAX_MESSAGES_PER_CONVERSATION;
+  if (!raw) return DEFAULT_MAX_MESSAGES;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_MESSAGES;
+}
+
+type Message = Awaited<ReturnType<typeof prisma.message.create>>;
+type HistoryEntry = { role: 'user' | 'assistant' | 'system'; content: string };
+
+export type AppendUserMessageOutcome =
+  | { kind: 'ok'; userMessage: Message; history: HistoryEntry[] }
+  | { kind: 'not-found' }
+  | { kind: 'too-many-messages' };
 
 export async function createConversation(userId: string, title?: string) {
   return prisma.conversation.create({
@@ -85,14 +101,21 @@ export async function appendUserMessage(
   userId: string,
   conversationId: string,
   content: string,
-) {
+): Promise<AppendUserMessageOutcome> {
   const conversation = await prisma.conversation.findUnique({
     where: { id: conversationId },
     select: { id: true, userId: true, title: true },
   });
 
   if (!conversation || conversation.userId !== userId) {
-    return null;
+    return { kind: 'not-found' };
+  }
+
+  const messageCount = await prisma.message.count({
+    where: { conversationId },
+  });
+  if (messageCount >= getMaxMessagesPerConversation()) {
+    return { kind: 'too-many-messages' };
   }
 
   const userMessage = await prisma.message.create({
@@ -119,7 +142,7 @@ export async function appendUserMessage(
     select: { role: true, content: true },
   });
 
-  return { userMessage, history };
+  return { kind: 'ok', userMessage, history };
 }
 
 export async function appendAssistantMessage(conversationId: string, content: string) {

@@ -13,10 +13,12 @@ export interface AssistantTextStream {
 export function streamAssistantText(
   messages: LLMMessage[],
   modelId: string = DEFAULT_MODEL_ID,
+  abortSignal?: AbortSignal,
 ): AssistantTextStream {
   return streamText({
     model: resolveModel(modelId),
     messages,
+    abortSignal,
   });
 }
 

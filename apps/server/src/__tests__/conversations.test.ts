@@ -27,7 +27,7 @@ vi.mock('../lib/db', () => ({
       update: vi.fn(),
       delete: vi.fn(),
     },
-    message: { create: vi.fn(), findMany: vi.fn() },
+    message: { create: vi.fn(), findMany: vi.fn(), count: vi.fn() },
     file: { findMany: vi.fn() },
   },
 }));
@@ -93,6 +93,7 @@ describe('Conversations API', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockedPrisma.file.findMany.mockResolvedValue([] as never);
+    mockedPrisma.message.count.mockResolvedValue(0 as never);
   });
 
   describe('Auth enforcement', () => {
@@ -466,6 +467,66 @@ describe('Conversations API', () => {
     });
   });
 
+  describe('Message limit', () => {
+    it('returns 400 with CONVERSATION_FULL when the conversation already has 100 messages', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+        title: 'Custom',
+      } as never);
+      mockedPrisma.message.count.mockResolvedValue(100 as never);
+
+      const res = await request(app)
+        .post('/api/conversations/conv-1/messages?stream=false')
+        .set('Cookie', 'session_id=session-1')
+        .send({ content: 'one more' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('CONVERSATION_FULL');
+      expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+      expect(mockedGenerate).not.toHaveBeenCalled();
+    });
+
+    it('still accepts a message when the count is just under the limit', async () => {
+      authedSession();
+      const now = new Date();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        userId: USER_ID,
+        title: 'Custom',
+      } as never);
+      mockedPrisma.message.count.mockResolvedValue(99 as never);
+      mockedPrisma.message.create
+        .mockResolvedValueOnce({
+          id: 'm-user',
+          conversationId: 'conv-1',
+          role: 'user',
+          content: 'hi',
+          createdAt: now,
+        } as never)
+        .mockResolvedValueOnce({
+          id: 'm-asst',
+          conversationId: 'conv-1',
+          role: 'assistant',
+          content: 'hello',
+          createdAt: now,
+        } as never);
+      mockedPrisma.message.findMany.mockResolvedValue([
+        { role: 'user', content: 'hi' },
+      ] as never);
+      mockedPrisma.conversation.update.mockResolvedValue({} as never);
+      mockedGenerate.mockResolvedValue('hello');
+
+      const res = await request(app)
+        .post('/api/conversations/conv-1/messages?stream=false')
+        .set('Cookie', 'session_id=session-1')
+        .send({ content: 'hi' });
+
+      expect(res.status).toBe(201);
+    });
+  });
+
   describe('POST /api/conversations/:id/messages', () => {
     it('returns 400 if content is missing or empty', async () => {
       authedSession();
@@ -633,6 +694,95 @@ describe('Conversations API', () => {
         // assistant message persisted with the concatenated stream text
         expect(mockedPrisma.message.create).toHaveBeenNthCalledWith(2, {
           data: { conversationId: 'conv-1', role: 'assistant', content: 'Hi there!' },
+        });
+      });
+
+      it('forwards an abort signal to streamAssistantText so the SDK can cancel mid-stream', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        mockedPrisma.message.create
+          .mockResolvedValueOnce({
+            id: 'm-user',
+            conversationId: 'conv-1',
+            role: 'user',
+            content: 'hello',
+            createdAt: now,
+          } as never)
+          .mockResolvedValueOnce({
+            id: 'm-asst',
+            conversationId: 'conv-1',
+            role: 'assistant',
+            content: 'ok',
+            createdAt: now,
+          } as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'hello' },
+        ] as never);
+        mockedPrisma.conversation.update.mockResolvedValue({} as never);
+        mockedStream.mockReturnValue(chunksOf('ok'));
+
+        await request(app)
+          .post('/api/conversations/conv-1/messages')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'hello' });
+
+        expect(mockedStream).toHaveBeenCalledTimes(1);
+        const passedSignal = mockedStream.mock.calls[0][2];
+        expect(passedSignal).toBeInstanceOf(AbortSignal);
+      });
+
+      it('persists the partial assistant text when the AI SDK throws an AbortError mid-stream', async () => {
+        authedSession();
+        const now = new Date();
+        mockedPrisma.conversation.findUnique.mockResolvedValue({
+          id: 'conv-1',
+          userId: USER_ID,
+        } as never);
+        mockedPrisma.message.create
+          .mockResolvedValueOnce({
+            id: 'm-user',
+            conversationId: 'conv-1',
+            role: 'user',
+            content: 'hello',
+            createdAt: now,
+          } as never)
+          .mockResolvedValueOnce({
+            id: 'm-asst-partial',
+            conversationId: 'conv-1',
+            role: 'assistant',
+            content: 'Hi ',
+            createdAt: now,
+          } as never);
+        mockedPrisma.message.findMany.mockResolvedValue([
+          { role: 'user', content: 'hello' },
+        ] as never);
+        mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+        // The AI SDK signals user-initiated abort by throwing AbortError.
+        // The route should catch it and persist the partial text.
+        mockedStream.mockReturnValue({
+          textStream: (async function* () {
+            yield 'Hi ';
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            throw err;
+          })(),
+        });
+
+        const res = await request(app)
+          .post('/api/conversations/conv-1/messages')
+          .set('Cookie', 'session_id=session-1')
+          .send({ content: 'hello' });
+
+        expect(res.headers['content-type']).toContain('text/event-stream');
+        // user + partial assistant both persisted
+        expect(mockedPrisma.message.create).toHaveBeenCalledTimes(2);
+        expect(mockedPrisma.message.create).toHaveBeenNthCalledWith(2, {
+          data: { conversationId: 'conv-1', role: 'assistant', content: 'Hi ' },
         });
       });
 
