@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   Conversation,
   ConversationFile,
@@ -9,11 +9,20 @@ import type {
   UserResponse,
   UserSettingsResponse,
 } from '@ai-app/shared';
-import { apiDelete, apiGet, apiPatch, apiPost, apiUpload, readSseEvents } from '../lib/api';
+import { apiDelete, apiGet, apiPatch, apiPost, apiUpload, isRateLimited, RATE_LIMIT_MESSAGE, readSseEvents } from '../lib/api';
 import { SettingsModal } from '../components/SettingsModal';
+import { MarkdownMessage } from '../components/MarkdownMessage';
 
 const DEFAULT_CONVERSATION_TITLE = 'New conversation';
 const AUTO_TITLE_MAX_LENGTH = 50;
+
+interface Toast {
+  id: number;
+  message: string;
+  type: 'error' | 'info';
+}
+
+let toastCounter = 0;
 
 export default function Home() {
   const [user, setUser] = useState<UserResponse | null>(null);
@@ -31,8 +40,41 @@ export default function Home() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [conversationFull, setConversationFull] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const userScrolledUpRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // --- Toast helpers ---
+  const addToast = useCallback((message: string, type: 'error' | 'info' = 'error') => {
+    const id = ++toastCounter;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 6000);
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // --- Smart auto-scroll ---
+  const scrollToBottom = useCallback(() => {
+    if (!userScrolledUpRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, []);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    userScrolledUpRef.current = distanceFromBottom > 80;
+  }, []);
 
   useEffect(() => {
     apiGet('/api/auth/me')
@@ -69,6 +111,7 @@ export default function Home() {
   useEffect(() => {
     if (!activeId) {
       setActiveConversation(null);
+      setConversationFull(false);
       return;
     }
 
@@ -77,6 +120,7 @@ export default function Home() {
       .then((data) => {
         if (data.success) {
           setActiveConversation(data.conversation as ConversationWithMessages);
+          setConversationFull(false);
         }
       })
       .catch(console.error);
@@ -86,8 +130,12 @@ export default function Home() {
     activeConversation?.messages[activeConversation.messages.length - 1]?.content;
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeConversation?.messages.length, lastMessageContent]);
+    scrollToBottom();
+  }, [activeConversation?.messages.length, lastMessageContent, scrollToBottom]);
+
+  function handleStopGenerating() {
+    abortControllerRef.current?.abort();
+  }
 
   async function handleNewConversation() {
     const res = await apiPost('/api/conversations', {});
@@ -96,6 +144,7 @@ export default function Home() {
       const conversation = data.conversation as Conversation;
       setConversations((prev) => [conversation, ...prev]);
       setActiveId(conversation.id);
+      setSidebarOpen(false);
     }
   }
 
@@ -105,6 +154,7 @@ export default function Home() {
     if (!content || !activeId || isSending) return;
 
     setIsSending(true);
+    setConversationFull(false);
     const ts = Date.now();
     const optimisticUserId = `optimistic-user-${ts}`;
     const streamingAssistantId = `streaming-assistant-${ts}`;
@@ -132,6 +182,7 @@ export default function Home() {
     );
     setStreamingId(streamingAssistantId);
     setDraft('');
+    userScrolledUpRef.current = false;
 
     const removeOptimistic = () =>
       setActiveConversation((prev) =>
@@ -145,15 +196,27 @@ export default function Home() {
           : prev,
       );
 
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       const useStream = settings?.streamingEnabled ?? true;
       const url = useStream
         ? `/api/conversations/${activeId}/messages?stream=true`
         : `/api/conversations/${activeId}/messages?stream=false`;
-      const res = await apiPost(url, { content });
+      const res = await apiPost(url, { content }, abortController.signal);
 
       if (!res.ok) {
         removeOptimistic();
+        const data = await res.json().catch(() => ({}));
+
+        if (data.code === 'CONVERSATION_FULL') {
+          setConversationFull(true);
+        } else if (isRateLimited(res.status)) {
+          addToast(RATE_LIMIT_MESSAGE);
+        } else {
+          addToast(data.error || 'Something went wrong. Please try again.');
+        }
         return;
       }
 
@@ -192,6 +255,7 @@ export default function Home() {
           );
         } else {
           removeOptimistic();
+          addToast(data.error || 'Failed to send message.');
         }
         return;
       }
@@ -239,7 +303,9 @@ export default function Home() {
           );
         } else if (evt.event === 'error') {
           receivedError = true;
+          const { message } = evt.data as { message?: string };
           removeOptimistic();
+          addToast(message || 'AI provider error. Please try again.');
         }
       }
 
@@ -264,9 +330,16 @@ export default function Home() {
         );
       }
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        // User clicked "Stop generating" — keep partial content visible
+        setStreamingId(null);
+        return;
+      }
       console.error(err);
       removeOptimistic();
+      addToast('Network error. Please check your connection and try again.');
     } finally {
+      abortControllerRef.current = null;
       setStreamingId(null);
       setIsSending(false);
     }
@@ -339,7 +412,9 @@ export default function Home() {
         const res = await apiUpload(`/api/conversations/${activeId}/files`, file);
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.success) {
-          setUploadError(data?.error ?? 'Upload failed');
+          const errorMsg = data?.error ?? 'Upload failed';
+          setUploadError(errorMsg);
+          addToast(errorMsg);
           break;
         }
         const uploaded = data.file as ConversationFile;
@@ -352,6 +427,7 @@ export default function Home() {
     } catch (err) {
       console.error(err);
       setUploadError('Upload failed');
+      addToast('File upload failed. Please try again.');
     } finally {
       setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -384,17 +460,48 @@ export default function Home() {
     }
   }
 
+  function selectConversation(id: string) {
+    setActiveId(id);
+    setSidebarOpen(false);
+  }
+
+  const isStreaming = streamingId !== null;
+
   return (
     <main className="flex h-screen bg-gray-50">
-      <aside className="flex w-72 flex-col border-r border-gray-200 bg-white">
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      {/* Sidebar */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-gray-200 bg-white transition-transform duration-200 md:static md:translate-x-0 ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
         <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
           <h2 className="text-sm font-semibold text-gray-900">Conversations</h2>
-          <button
-            onClick={handleNewConversation}
-            className="rounded-md bg-blue-600 px-2 py-1 text-xs font-medium text-white shadow-sm hover:bg-blue-500"
-          >
-            + New
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleNewConversation}
+              className="rounded-md bg-blue-600 px-2 py-1 text-xs font-medium text-white shadow-sm hover:bg-blue-500"
+            >
+              + New
+            </button>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              className="rounded p-1 text-gray-500 hover:bg-gray-100 md:hidden"
+              aria-label="Close sidebar"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
         </div>
         <ul className="flex-1 overflow-y-auto">
           {conversations.length === 0 ? (
@@ -435,7 +542,7 @@ export default function Home() {
                     }`}
                   >
                     <button
-                      onClick={() => setActiveId(c.id)}
+                      onClick={() => selectConversation(c.id)}
                       className={`flex-1 truncate px-4 py-3 text-left text-sm ${
                         c.id === activeId
                           ? 'font-medium text-blue-700'
@@ -498,8 +605,19 @@ export default function Home() {
       <section className="flex flex-1 flex-col">
         {activeConversation ? (
           <>
-            <header className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-3">
-              <h1 className="text-sm font-semibold text-gray-900">{activeConversation.title}</h1>
+            <header className="flex items-center justify-between border-b border-gray-200 bg-white px-4 py-3 md:px-6">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setSidebarOpen(true)}
+                  className="rounded p-1 text-gray-500 hover:bg-gray-100 md:hidden"
+                  aria-label="Open sidebar"
+                >
+                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                  </svg>
+                </button>
+                <h1 className="truncate text-sm font-semibold text-gray-900">{activeConversation.title}</h1>
+              </div>
               {settings ? (
                 <button
                   type="button"
@@ -512,7 +630,11 @@ export default function Home() {
                 </button>
               ) : null}
             </header>
-            <div className="flex-1 overflow-y-auto px-6 py-4">
+            <div
+              ref={scrollContainerRef}
+              onScroll={handleScroll}
+              className="flex-1 overflow-y-auto px-4 py-4 md:px-6"
+            >
               <ul className="mx-auto flex max-w-3xl flex-col gap-3">
                 {activeConversation.messages.length === 0 ? (
                   <li className="py-8 text-center text-sm text-gray-500">
@@ -520,17 +642,17 @@ export default function Home() {
                   </li>
                 ) : (
                   activeConversation.messages.map((m) => {
-                    const isStreaming = m.id === streamingId;
-                    const isEmptyStreaming = isStreaming && m.content.length === 0;
+                    const isCurrentlyStreaming = m.id === streamingId;
+                    const isEmptyStreaming = isCurrentlyStreaming && m.content.length === 0;
                     return (
                       <li
                         key={m.id}
                         className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
                       >
                         <div
-                          className={`max-w-[80%] whitespace-pre-wrap rounded-lg px-4 py-2 text-sm ${
+                          className={`max-w-[80%] rounded-lg px-4 py-2 text-sm ${
                             m.role === 'user'
-                              ? 'bg-blue-600 text-white'
+                              ? 'whitespace-pre-wrap bg-blue-600 text-white'
                               : 'bg-white text-gray-900 shadow'
                           }`}
                         >
@@ -543,6 +665,8 @@ export default function Home() {
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.15s]" />
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400" />
                             </span>
+                          ) : m.role === 'assistant' ? (
+                            <MarkdownMessage content={m.content} />
                           ) : (
                             m.content
                           )}
@@ -554,9 +678,40 @@ export default function Home() {
                 <div ref={messagesEndRef} />
               </ul>
             </div>
+
+            {/* Stop generating button */}
+            {isStreaming && (
+              <div className="flex justify-center border-t border-gray-100 bg-gray-50 py-2">
+                <button
+                  type="button"
+                  onClick={handleStopGenerating}
+                  className="rounded-md border border-gray-300 bg-white px-4 py-1.5 text-xs font-medium text-gray-700 shadow-sm hover:bg-gray-50"
+                >
+                  Stop generating
+                </button>
+              </div>
+            )}
+
+            {/* Conversation full banner */}
+            {conversationFull && (
+              <div className="border-t border-amber-200 bg-amber-50 px-4 py-3 text-center md:px-6">
+                <p className="text-sm text-amber-800">
+                  This conversation has reached the message limit.{' '}
+                  <button
+                    type="button"
+                    onClick={handleNewConversation}
+                    className="font-semibold underline hover:text-amber-900"
+                  >
+                    Start a new conversation
+                  </button>{' '}
+                  to continue.
+                </p>
+              </div>
+            )}
+
             <form
               onSubmit={handleSend}
-              className="border-t border-gray-200 bg-white px-6 py-4"
+              className="border-t border-gray-200 bg-white px-4 py-4 md:px-6"
             >
               <div className="mx-auto flex max-w-3xl flex-col gap-2">
                 {activeConversation.files.length > 0 && (
@@ -567,7 +722,7 @@ export default function Home() {
                         className="flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs text-gray-700"
                       >
                         <span className="max-w-[12rem] truncate" title={f.originalName}>
-                          📎 {f.originalName}
+                          {f.originalName}
                         </span>
                         <button
                           type="button"
@@ -576,7 +731,7 @@ export default function Home() {
                           title="Remove"
                           className="rounded-full px-1 text-gray-500 hover:bg-gray-200 hover:text-gray-900"
                         >
-                          ×
+                          x
                         </button>
                       </li>
                     ))}
@@ -599,7 +754,7 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={isUploading || isSending}
+                    disabled={isUploading || isSending || conversationFull}
                     title="Attach a PDF, Word, or text file"
                     className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
                   >
@@ -609,13 +764,13 @@ export default function Home() {
                     type="text"
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
-                    placeholder="Type a message..."
-                    disabled={isSending}
+                    placeholder={conversationFull ? 'Message limit reached' : 'Type a message...'}
+                    disabled={isSending || conversationFull}
                     className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
                   />
                   <button
                     type="submit"
-                    disabled={isSending || draft.trim().length === 0}
+                    disabled={isSending || draft.trim().length === 0 || conversationFull}
                     className="rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {isSending ? 'Sending...' : 'Send'}
@@ -627,6 +782,15 @@ export default function Home() {
         ) : (
           <div className="flex flex-1 items-center justify-center">
             <div className="text-center">
+              <button
+                onClick={() => setSidebarOpen(true)}
+                className="mb-4 rounded p-1 text-gray-500 hover:bg-gray-100 md:hidden"
+                aria-label="Open sidebar"
+              >
+                <svg className="mx-auto h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                </svg>
+              </button>
               <p className="text-sm text-gray-600">No conversation selected.</p>
               <button
                 onClick={handleNewConversation}
@@ -638,6 +802,33 @@ export default function Home() {
           </div>
         )}
       </section>
+
+      {/* Toast notifications */}
+      {toasts.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              role="alert"
+              className={`flex items-start gap-2 rounded-lg px-4 py-3 text-sm shadow-lg ${
+                t.type === 'error'
+                  ? 'bg-red-600 text-white'
+                  : 'bg-gray-800 text-white'
+              }`}
+            >
+              <span className="flex-1">{t.message}</span>
+              <button
+                type="button"
+                onClick={() => dismissToast(t.id)}
+                className="ml-2 flex-shrink-0 text-white/80 hover:text-white"
+                aria-label="Dismiss"
+              >
+                x
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       <SettingsModal
         open={isSettingsOpen}

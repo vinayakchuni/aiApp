@@ -232,8 +232,16 @@ conversationsRouter.post(
     const id = String(req.params.id);
     const result = await appendUserMessage(req.user!.id, id, content);
 
-    if (!result) {
+    if (result.kind === 'not-found') {
       res.status(404).json({ success: false, error: 'Conversation not found' });
+      return;
+    }
+    if (result.kind === 'too-many-messages') {
+      res.status(400).json({
+        success: false,
+        error: 'This conversation has reached the message limit. Start a new conversation to continue.',
+        code: 'CONVERSATION_FULL',
+      });
       return;
     }
 
@@ -284,20 +292,42 @@ conversationsRouter.post(
 
     writeSseEvent(res, 'user-message', { userMessage });
 
+    const abortController = new AbortController();
+    const onClose = () => abortController.abort();
+    req.on('close', onClose);
+
     let full = '';
     try {
-      const { textStream } = streamAssistantText(modelMessages, modelId);
+      const { textStream } = streamAssistantText(
+        modelMessages,
+        modelId,
+        abortController.signal,
+      );
       for await (const chunk of textStream) {
         full += chunk;
         writeSseEvent(res, 'chunk', { text: chunk });
       }
     } catch (err) {
+      req.off('close', onClose);
+      const isAbort =
+        abortController.signal.aborted ||
+        (err instanceof Error && err.name === 'AbortError');
+      if (isAbort) {
+        if (full.length > 0) {
+          await appendAssistantMessage(id, full).catch((persistErr) => {
+            console.error('Failed to persist partial assistant message:', persistErr);
+          });
+        }
+        res.end();
+        return;
+      }
       console.error('AI stream failed:', err);
       writeSseEvent(res, 'error', { message: 'AI provider error' });
       res.end();
       return;
     }
 
+    req.off('close', onClose);
     const assistantMessage = await appendAssistantMessage(id, full);
     writeSseEvent(res, 'done', { assistantMessage });
     res.end();

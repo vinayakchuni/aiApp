@@ -13,7 +13,11 @@ export async function fetchCsrfToken(): Promise<string> {
   return csrfToken!;
 }
 
-export async function apiPost(path: string, body?: Record<string, unknown>): Promise<Response> {
+export async function apiPost(
+  path: string,
+  body?: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<Response> {
   const token = await fetchCsrfToken();
 
   return fetch(`${API_URL}${path}`, {
@@ -24,6 +28,7 @@ export async function apiPost(path: string, body?: Record<string, unknown>): Pro
     },
     credentials: 'include',
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
 }
 
