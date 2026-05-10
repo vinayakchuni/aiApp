@@ -31,4 +31,27 @@ describe('buildModelMessages', () => {
     expect(result[0]).toEqual({ role: 'system', content: 'You are a pirate.' });
     expect(result).toHaveLength(2);
   });
+
+  it('injects file content as system messages between system prompt and history', () => {
+    const result = buildModelMessages({
+      history: [{ role: 'user', content: 'summarize the doc' }],
+      files: [
+        { originalName: 'spec.pdf', extractedText: 'PDF content here' },
+        { originalName: 'notes.txt', extractedText: 'TXT content here' },
+      ],
+    });
+    expect(result).toHaveLength(4);
+    expect(result[0]).toEqual({ role: 'system', content: DEFAULT_SYSTEM_PROMPT });
+    expect(result[1]).toEqual({
+      role: 'system',
+      content:
+        '[Uploaded file: spec.pdf]\nPDF content here\n[End of file: spec.pdf]',
+    });
+    expect(result[2]).toEqual({
+      role: 'system',
+      content:
+        '[Uploaded file: notes.txt]\nTXT content here\n[End of file: notes.txt]',
+    });
+    expect(result[3]).toEqual({ role: 'user', content: 'summarize the doc' });
+  });
 });

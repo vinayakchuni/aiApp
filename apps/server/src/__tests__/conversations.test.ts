@@ -28,6 +28,7 @@ vi.mock('../lib/db', () => ({
       delete: vi.fn(),
     },
     message: { create: vi.fn(), findMany: vi.fn() },
+    file: { findMany: vi.fn() },
   },
 }));
 
@@ -91,6 +92,7 @@ function parseSseEvents(body: string) {
 describe('Conversations API', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
   });
 
   describe('Auth enforcement', () => {

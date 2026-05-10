@@ -16,8 +16,11 @@ export interface Conversation {
   updatedAt: string;
 }
 
+import type { ConversationFile } from './file';
+
 export interface ConversationWithMessages extends Conversation {
   messages: Message[];
+  files: ConversationFile[];
 }
 
 export interface CreateConversationRequest {

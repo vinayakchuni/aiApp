@@ -60,6 +60,17 @@ export async function getConversationForUser(userId: string, conversationId: str
       messages: {
         orderBy: { createdAt: 'asc' },
       },
+      files: {
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true,
+          conversationId: true,
+          originalName: true,
+          mimeType: true,
+          size: true,
+          createdAt: true,
+        },
+      },
     },
   });
 

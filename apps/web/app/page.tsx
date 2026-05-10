@@ -3,12 +3,13 @@
 import { useEffect, useRef, useState } from 'react';
 import type {
   Conversation,
+  ConversationFile,
   ConversationWithMessages,
   Message,
   UserResponse,
   UserSettingsResponse,
 } from '@ai-app/shared';
-import { apiDelete, apiGet, apiPatch, apiPost, readSseEvents } from '../lib/api';
+import { apiDelete, apiGet, apiPatch, apiPost, apiUpload, readSseEvents } from '../lib/api';
 import { SettingsModal } from '../components/SettingsModal';
 
 const DEFAULT_CONVERSATION_TITLE = 'New conversation';
@@ -28,6 +29,9 @@ export default function Home() {
   const [editingTitle, setEditingTitle] = useState('');
   const [settings, setSettings] = useState<UserSettingsResponse | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -326,6 +330,50 @@ export default function Home() {
     }
   }
 
+  async function handleUploadFiles(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0 || !activeId) return;
+    setUploadError(null);
+    setIsUploading(true);
+    try {
+      for (const file of Array.from(fileList)) {
+        const res = await apiUpload(`/api/conversations/${activeId}/files`, file);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+          setUploadError(data?.error ?? 'Upload failed');
+          break;
+        }
+        const uploaded = data.file as ConversationFile;
+        setActiveConversation((prev) =>
+          prev && prev.id === activeId
+            ? { ...prev, files: [...prev.files, uploaded] }
+            : prev,
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      setUploadError('Upload failed');
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
+  async function handleRemoveFile(file: ConversationFile) {
+    if (!activeId) return;
+    const previousFiles = activeConversation?.files ?? [];
+    setActiveConversation((prev) =>
+      prev && prev.id === activeId
+        ? { ...prev, files: prev.files.filter((f) => f.id !== file.id) }
+        : prev,
+    );
+    const res = await apiDelete(`/api/conversations/${activeId}/files/${file.id}`);
+    if (!res.ok) {
+      setActiveConversation((prev) =>
+        prev && prev.id === activeId ? { ...prev, files: previousFiles } : prev,
+      );
+    }
+  }
+
   async function handleLogout() {
     setIsLoggingOut(true);
     try {
@@ -510,22 +558,69 @@ export default function Home() {
               onSubmit={handleSend}
               className="border-t border-gray-200 bg-white px-6 py-4"
             >
-              <div className="mx-auto flex max-w-3xl gap-2">
-                <input
-                  type="text"
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  placeholder="Type a message..."
-                  disabled={isSending}
-                  className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
-                />
-                <button
-                  type="submit"
-                  disabled={isSending || draft.trim().length === 0}
-                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {isSending ? 'Sending...' : 'Send'}
-                </button>
+              <div className="mx-auto flex max-w-3xl flex-col gap-2">
+                {activeConversation.files.length > 0 && (
+                  <ul className="flex flex-wrap gap-2">
+                    {activeConversation.files.map((f) => (
+                      <li
+                        key={f.id}
+                        className="flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs text-gray-700"
+                      >
+                        <span className="max-w-[12rem] truncate" title={f.originalName}>
+                          📎 {f.originalName}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void handleRemoveFile(f)}
+                          aria-label={`Remove ${f.originalName}`}
+                          title="Remove"
+                          className="rounded-full px-1 text-gray-500 hover:bg-gray-200 hover:text-gray-900"
+                        >
+                          ×
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {uploadError && (
+                  <p role="alert" className="text-xs text-red-600">
+                    {uploadError}
+                  </p>
+                )}
+                <div className="flex gap-2">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                    onChange={(e) => void handleUploadFiles(e.target.files)}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isUploading || isSending}
+                    title="Attach a PDF, Word, or text file"
+                    className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isUploading ? 'Uploading...' : 'Attach'}
+                  </button>
+                  <input
+                    type="text"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    placeholder="Type a message..."
+                    disabled={isSending}
+                    className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isSending || draft.trim().length === 0}
+                    className="rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isSending ? 'Sending...' : 'Send'}
+                  </button>
+                </div>
               </div>
             </form>
           </>

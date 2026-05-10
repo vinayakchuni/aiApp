@@ -60,6 +60,21 @@ export async function apiDelete(path: string): Promise<Response> {
   });
 }
 
+export async function apiUpload(path: string, file: File): Promise<Response> {
+  const token = await fetchCsrfToken();
+  const form = new FormData();
+  form.append('file', file);
+
+  return fetch(`${API_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      'x-csrf-token': token,
+    },
+    credentials: 'include',
+    body: form,
+  });
+}
+
 export function isRateLimited(status: number): boolean {
   return status === 429;
 }

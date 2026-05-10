@@ -1,4 +1,5 @@
 import { Router, type Router as RouterType } from 'express';
+import multer from 'multer';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth';
 import { csrfProtection } from '../middleware/csrf';
 import {
@@ -13,7 +14,18 @@ import {
 import { buildModelMessages } from '../services/context';
 import { streamAssistantText, generateAssistantText } from '../services/ai';
 import { isSupportedModel, DEFAULT_MODEL_ID } from '../services/models';
+import {
+  ingestUploadedFile,
+  removeFile,
+  listFilesForConversation,
+  getMaxFileSizeBytes,
+} from '../services/files';
 import { prisma } from '../lib/db';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: getMaxFileSizeBytes() },
+});
 
 export const conversationsRouter: RouterType = Router();
 
@@ -93,6 +105,118 @@ function writeSseEvent(res: import('express').Response, event: string, data: unk
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+function uploadSingle(
+  req: import('express').Request,
+  res: import('express').Response,
+  next: import('express').NextFunction,
+) {
+  upload.single('file')(req, res, (err: unknown) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        res.status(413).json({ success: false, error: 'File too large' });
+        return;
+      }
+      res.status(400).json({ success: false, error: err.message });
+      return;
+    }
+    if (err) {
+      next(err);
+      return;
+    }
+    next();
+  });
+}
+
+function publicFile(file: {
+  id: string;
+  conversationId: string;
+  originalName: string;
+  mimeType: string;
+  size: number;
+  createdAt: Date;
+}) {
+  return {
+    id: file.id,
+    conversationId: file.conversationId,
+    originalName: file.originalName,
+    mimeType: file.mimeType,
+    size: file.size,
+    createdAt: file.createdAt,
+  };
+}
+
+conversationsRouter.post(
+  '/:id/files',
+  csrfProtection,
+  requireAuth,
+  uploadSingle,
+  async (req: AuthenticatedRequest, res) => {
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ success: false, error: 'File is required (field name: "file")' });
+      return;
+    }
+
+    const id = String(req.params.id);
+    const outcome = await ingestUploadedFile({
+      userId: req.user!.id,
+      conversationId: id,
+      originalName: file.originalname,
+      mimeType: file.mimetype,
+      size: file.size,
+      buffer: file.buffer,
+    });
+
+    switch (outcome.kind) {
+      case 'not-found':
+        res.status(404).json({ success: false, error: 'Conversation not found' });
+        return;
+      case 'unsupported-type':
+        res.status(415).json({
+          success: false,
+          error: 'Unsupported file type. Allowed: pdf, docx, txt',
+        });
+        return;
+      case 'too-large':
+        res.status(413).json({ success: false, error: 'File too large' });
+        return;
+      case 'too-many-files':
+        res.status(409).json({
+          success: false,
+          error: 'Conversation has reached the file limit',
+        });
+        return;
+      case 'extraction-failed':
+        res.status(422).json({
+          success: false,
+          error: 'Could not extract text from file',
+        });
+        return;
+      case 'ok':
+        res.status(201).json({ success: true, file: publicFile(outcome.file) });
+        return;
+    }
+  },
+);
+
+conversationsRouter.delete(
+  '/:id/files/:fileId',
+  csrfProtection,
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const id = String(req.params.id);
+    const fileId = String(req.params.fileId);
+    const outcome = await removeFile(req.user!.id, id, fileId);
+
+    if (outcome === 'not-found') {
+      res.status(404).json({ success: false, error: 'File not found' });
+      return;
+    }
+
+    res.json({ success: true });
+  },
+);
+
 conversationsRouter.post(
   '/:id/messages',
   csrfProtection,
@@ -114,7 +238,14 @@ conversationsRouter.post(
     }
 
     const { userMessage, history } = result;
-    const modelMessages = buildModelMessages({ history });
+    const files = await listFilesForConversation(id);
+    const modelMessages = buildModelMessages({
+      history,
+      files: files.map((f) => ({
+        originalName: f.originalName,
+        extractedText: f.extractedText,
+      })),
+    });
 
     const userSettings = await prisma.user.findUnique({
       where: { id: req.user!.id },
