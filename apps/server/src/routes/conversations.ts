@@ -27,6 +27,7 @@ import {
   processClarifyingAnswer,
   runResearchPipeline,
   getLatestResearchFinal,
+  isResearchActiveForUser,
 } from '../services/research';
 import { generateResearchPdf } from '../services/pdf';
 import { prisma } from '../lib/db';
@@ -338,6 +339,16 @@ conversationsRouter.post(
   async (req: AuthenticatedRequest, res) => {
     const id = String(req.params.id);
 
+    if (isResearchActiveForUser(req.user!.id)) {
+      res.status(409).json({
+        success: false,
+        error:
+          'You already have a research task running. Please wait for it to finish before starting another.',
+        code: 'RESEARCH_BUSY',
+      });
+      return;
+    }
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -373,6 +384,13 @@ conversationsRouter.post(
         writeSseEvent(res, 'research-failed', {
           code: 'WRONG_STATUS',
           message: 'Research is not ready to run on this conversation.',
+        });
+        break;
+      case 'busy':
+        writeSseEvent(res, 'research-failed', {
+          code: 'RESEARCH_BUSY',
+          message:
+            'You already have a research task running. Please wait for it to finish before starting another.',
         });
         break;
       case 'insufficient-sources':

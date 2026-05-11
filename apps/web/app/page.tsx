@@ -15,6 +15,7 @@ import type {
   ResearchFailedEvent,
   ResearchProgressEvent,
   ResearchSource,
+  ResearchStatus,
   StructuredReport,
   UserResponse,
   UserSettingsResponse,
@@ -35,6 +36,7 @@ interface Toast {
 let toastCounter = 0;
 
 type ResearchFinalMetadata = Extract<MessageMetadata, { kind: 'research_final' }>;
+type ResearchFailedMetadata = Extract<MessageMetadata, { kind: 'research_failed' }>;
 
 function asResearchFinal(
   metadata: Message['metadata'],
@@ -42,6 +44,40 @@ function asResearchFinal(
   if (!metadata || typeof metadata !== 'object') return null;
   if ((metadata as { kind?: string }).kind !== 'research_final') return null;
   return metadata as ResearchFinalMetadata;
+}
+
+function asResearchFailed(
+  metadata: Message['metadata'],
+): ResearchFailedMetadata | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  if ((metadata as { kind?: string }).kind !== 'research_failed') return null;
+  return metadata as ResearchFailedMetadata;
+}
+
+interface ResearchStatusBadge {
+  label: string;
+  className: string;
+}
+
+function researchStatusBadge(status: ResearchStatus): ResearchStatusBadge | null {
+  switch (status) {
+    case 'idle':
+      return { label: 'Research', className: 'bg-purple-100 text-purple-700' };
+    case 'clarifying':
+      return { label: 'Clarifying', className: 'bg-purple-100 text-purple-700' };
+    case 'researching':
+    case 'drafting':
+    case 'critiquing':
+    case 'fact_checking':
+    case 'finalizing':
+      return { label: 'Researching…', className: 'bg-amber-100 text-amber-800' };
+    case 'complete':
+      return { label: 'Complete', className: 'bg-green-100 text-green-800' };
+    case 'failed':
+      return { label: 'Failed', className: 'bg-red-100 text-red-800' };
+    default:
+      return null;
+  }
 }
 
 function latestFactCheck(
@@ -640,7 +676,15 @@ export default function Home() {
 
       if (!res.ok) {
         removePlaceholder();
-        addToast('Could not start research. Please try again.');
+        const data = await res.json().catch(() => ({}));
+        if (data?.code === 'RESEARCH_BUSY') {
+          addToast(
+            data.error ||
+              'You already have a research task running. Please wait for it to finish.',
+          );
+        } else {
+          addToast(data?.error || 'Could not start research. Please try again.');
+        }
         setResearchProgress(null);
         return;
       }
@@ -695,6 +739,10 @@ export default function Home() {
             ),
           );
         }
+        addToast(
+          'Research complete. A copy has been sent to your email.',
+          'info',
+        );
       } else {
         removePlaceholder();
         if (!receivedFailure) {
@@ -1207,14 +1255,18 @@ export default function Home() {
                       }`}
                     >
                       <span className="flex items-center gap-2">
-                        {c.mode === 'research' && (
-                          <span
-                            title="Research conversation"
-                            className="inline-flex h-4 items-center rounded-sm bg-purple-100 px-1.5 text-[10px] font-semibold uppercase tracking-wide text-purple-700"
-                          >
-                            Research
-                          </span>
-                        )}
+                        {c.mode === 'research' &&
+                          (() => {
+                            const badge = researchStatusBadge(c.researchStatus);
+                            return badge ? (
+                              <span
+                                title={`Research status: ${c.researchStatus}`}
+                                className={`inline-flex h-4 items-center rounded-sm px-1.5 text-[10px] font-semibold uppercase tracking-wide ${badge.className}`}
+                              >
+                                {badge.label}
+                              </span>
+                            ) : null;
+                          })()}
                         <span className="truncate">{c.title}</span>
                       </span>
                     </button>
@@ -1284,14 +1336,18 @@ export default function Home() {
                   </svg>
                 </button>
                 <h1 className="truncate text-sm font-semibold text-gray-900">{activeConversation.title}</h1>
-                {activeConversation.mode === 'research' && (
-                  <span
-                    title={`Research status: ${activeConversation.researchStatus}`}
-                    className="inline-flex items-center rounded-full bg-purple-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-purple-700"
-                  >
-                    Research
-                  </span>
-                )}
+                {activeConversation.mode === 'research' &&
+                  (() => {
+                    const badge = researchStatusBadge(activeConversation.researchStatus);
+                    return badge ? (
+                      <span
+                        title={`Research status: ${activeConversation.researchStatus}`}
+                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badge.className}`}
+                      >
+                        {badge.label}
+                      </span>
+                    ) : null;
+                  })()}
               </div>
               <div className="flex items-center gap-2">
                 {activeConversation.messages.length === 0 && (
@@ -1348,6 +1404,8 @@ export default function Home() {
                     const isEmptyStreaming = isCurrentlyStreaming && m.content.length === 0;
                     const researchFinal =
                       m.role === 'assistant' ? asResearchFinal(m.metadata) : null;
+                    const researchFailed =
+                      m.role === 'assistant' ? asResearchFailed(m.metadata) : null;
                     return (
                       <li
                         key={m.id}
@@ -1357,7 +1415,9 @@ export default function Home() {
                           className={`max-w-[80%] rounded-lg px-4 py-2 text-sm ${
                             m.role === 'user'
                               ? 'whitespace-pre-wrap bg-blue-600 text-white'
-                              : 'bg-white text-gray-900 shadow'
+                              : researchFailed
+                                ? 'border border-red-200 bg-red-50 text-red-900 shadow'
+                                : 'bg-white text-gray-900 shadow'
                           }`}
                         >
                           {isEmptyStreaming ? (
@@ -1369,6 +1429,13 @@ export default function Home() {
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.15s]" />
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400" />
                             </span>
+                          ) : researchFailed ? (
+                            <div className="flex items-start gap-2">
+                              <span className="mt-0.5 inline-flex h-4 items-center rounded bg-red-200 px-1.5 text-[10px] font-semibold uppercase tracking-wide text-red-900">
+                                Research failed
+                              </span>
+                              <span className="flex-1 leading-relaxed">{m.content}</span>
+                            </div>
                           ) : m.role === 'assistant' ? (
                             <MarkdownMessage content={m.content} />
                           ) : (

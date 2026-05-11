@@ -38,6 +38,14 @@ vi.mock('../services/ai', () => ({
   generateAssistantText: vi.fn(),
 }));
 
+vi.mock('../services/email', () => ({
+  sendResearchCompleteEmail: vi.fn().mockResolvedValue(undefined),
+  sendVerificationEmail: vi.fn().mockResolvedValue(undefined),
+  sendPasswordResetEmail: vi.fn().mockResolvedValue(undefined),
+  renderResearchReportHtml: vi.fn(() => '<html></html>'),
+  renderResearchReportText: vi.fn(() => 'text'),
+}));
+
 vi.mock('../services/search', () => ({
   createSearchService: vi.fn(),
   getMaxSearchesPerResearch: vi.fn(() => 20),
@@ -59,6 +67,7 @@ vi.mock('../services/search', () => ({
 
 import { prisma } from '../lib/db';
 import { generateAssistantText } from '../services/ai';
+import { sendResearchCompleteEmail } from '../services/email';
 import {
   parseClarifyingQuestions,
   parseProcessAnswerResponse,
@@ -79,6 +88,9 @@ import {
   programmaticReportFromDraft,
   buildStructuredReport,
   getLatestResearchFinal,
+  isResearchActiveForUser,
+  _resetActiveResearch,
+  _acquireActiveResearch,
 } from '../services/research';
 import {
   createSearchService,
@@ -119,6 +131,7 @@ A longer analysis paragraph synthesizing the supplied sources [1], [2], and [3].
 
 const mockedPrisma = vi.mocked(prisma);
 const mockedGenerate = vi.mocked(generateAssistantText);
+const mockedSendResearchCompleteEmail = vi.mocked(sendResearchCompleteEmail);
 const USER_ID = 'user-1';
 const OTHER_USER_ID = 'user-2';
 
@@ -879,6 +892,7 @@ describe('runResearchPipeline', () => {
     };
     mockedCreateSearchService.mockReturnValue(fakeSearch as never);
     mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
 
@@ -887,8 +901,12 @@ describe('runResearchPipeline', () => {
       where: { id: 'conv-1' },
       data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
     });
-    // Draft not persisted
-    expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+    // Only the research_failed message is persisted (no draft).
+    const finalKinds = mockedPrisma.message.create.mock.calls.map((call) => {
+      const data = (call[0] as { data?: { metadata?: { kind?: string } } }).data;
+      return data?.metadata?.kind;
+    });
+    expect(finalKinds).toEqual(['research_failed']);
     // Draft LLM call NOT made
     expect(mockedGenerate).toHaveBeenCalledTimes(1);
   });
@@ -905,6 +923,7 @@ describe('runResearchPipeline', () => {
     };
     mockedCreateSearchService.mockReturnValue(fakeSearch as never);
     mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
     expect(out.kind).toBe('search-failed');
@@ -919,6 +938,7 @@ describe('runResearchPipeline', () => {
     setupHistory();
     mockedGenerate.mockRejectedValueOnce(new Error('llm down'));
     mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
     expect(out.kind).toBe('ai-error');
@@ -1044,7 +1064,14 @@ describe('runResearchPipeline', () => {
       where: { id: 'conv-1' },
       data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
     });
-    expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+    // A research_failed assistant message is persisted alongside the status flip,
+    // but no research_final/research_draft message.
+    const finalKinds = mockedPrisma.message.create.mock.calls.map((call) => {
+      const data = (call[0] as { data?: { metadata?: { kind?: string } } }).data;
+      return data?.metadata?.kind;
+    });
+    expect(finalKinds).not.toContain('research_final');
+    expect(finalKinds).toContain('research_failed');
   });
 });
 
@@ -1590,6 +1617,7 @@ describe('runResearchPipeline critique + revision loop', () => {
     setupHistory();
     setupSearch();
     mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
     mockedGenerate
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Initial draft.')
@@ -1601,7 +1629,13 @@ describe('runResearchPipeline critique + revision loop', () => {
       where: { id: 'conv-1' },
       data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
     });
-    expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+    // A research_failed message is persisted, but no research_final.
+    const finalKinds = mockedPrisma.message.create.mock.calls.map((call) => {
+      const data = (call[0] as { data?: { metadata?: { kind?: string } } }).data;
+      return data?.metadata?.kind;
+    });
+    expect(finalKinds).not.toContain('research_final');
+    expect(finalKinds).toContain('research_failed');
   });
 
   it('stores fact-check results in iteration metadata and revise prompt sees them', async () => {
@@ -2456,6 +2490,328 @@ describe('POST /api/conversations/:id/research/run (SSE)', () => {
     const failed = events.find((e) => e.event === 'research-failed');
     expect(failed).toBeDefined();
     expect((failed!.data as { code: string }).code).toBe('INSUFFICIENT_SOURCES');
+  });
+});
+
+describe('Phase 7: email notification on completion', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedGenerate.mockReset();
+    _resetActiveResearch();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+  });
+
+  it('sends a research completion email after the pipeline succeeds', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: {
+        preferredModel: 'openai:gpt-4o-mini',
+        email: 'recipient@example.com',
+      },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Climate impacts on agriculture', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: scope',
+        metadata: { kind: 'research_ready', summary: 'scope' },
+      },
+    ] as never);
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-final',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'final',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Climate impacts on agriculture',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+    });
+
+    expect(out.kind).toBe('ok');
+    // Fire-and-forget: yield once so the unawaited email promise resolves
+    await new Promise((r) => setImmediate(r));
+    expect(mockedSendResearchCompleteEmail).toHaveBeenCalledTimes(1);
+    const call = mockedSendResearchCompleteEmail.mock.calls[0][0];
+    expect(call.email).toBe('recipient@example.com');
+    expect(call.conversationId).toBe('conv-1');
+    expect(call.topic).toBe('Climate impacts on agriculture');
+    expect(call.report.executiveSummary).toBeDefined();
+  });
+
+  it('skips email when the user has no email address on record', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.message.create.mockResolvedValue({ id: 'm', conversationId: 'conv-1', role: 'assistant', content: 'final', createdAt: new Date() } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    await new Promise((r) => setImmediate(r));
+
+    expect(mockedSendResearchCompleteEmail).not.toHaveBeenCalled();
+  });
+
+  it('does not send an email when the pipeline fails (e.g., insufficient sources)', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini', email: 'r@example.com' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi
+        .fn()
+        .mockResolvedValue([{ title: 'A', url: 'https://a.example', snippet: '' }]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    await new Promise((r) => setImmediate(r));
+
+    expect(out.kind).toBe('insufficient-sources');
+    expect(mockedSendResearchCompleteEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe('Phase 7: single-active-research mutex', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedGenerate.mockReset();
+    _resetActiveResearch();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+  });
+
+  it('reports busy when a second pipeline starts while the first is still running', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini', email: 'r@example.com' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'final',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+
+    // The first pipeline call hangs on the planning LLM call until we resolve it.
+    let resolvePlanning!: (value: string) => void;
+    const planningPromise = new Promise<string>((r) => {
+      resolvePlanning = r;
+    });
+    mockedGenerate
+      .mockReturnValueOnce(planningPromise as never)
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const first = runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    // Yield so first awaits the planning promise and the mutex is acquired.
+    await new Promise((r) => setImmediate(r));
+    expect(isResearchActiveForUser(USER_ID)).toBe(true);
+
+    const busy = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-2',
+    });
+    expect(busy.kind).toBe('busy');
+
+    resolvePlanning('q1\nq2');
+    const firstOutcome = await first;
+    expect(firstOutcome.kind).toBe('ok');
+    expect(isResearchActiveForUser(USER_ID)).toBe(false);
+  });
+
+  it('releases the mutex when the pipeline throws an unexpected error', async () => {
+    mockedPrisma.conversation.findUnique.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(
+      runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' }),
+    ).rejects.toThrow('db down');
+
+    expect(isResearchActiveForUser(USER_ID)).toBe(false);
+  });
+
+  it('returns 409 + RESEARCH_BUSY from POST /:id/research/run when already active', async () => {
+    authedSession();
+    _acquireActiveResearch(USER_ID);
+
+    const res = await request(app)
+      .post('/api/conversations/conv-2/research/run')
+      .set('Cookie', 'session_id=session-1')
+      .send({});
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('RESEARCH_BUSY');
+  });
+});
+
+describe('Phase 7: failure messages persisted to conversation', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedGenerate.mockReset();
+    _resetActiveResearch();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+  });
+
+  it('creates an assistant message with kind=research_failed on insufficient-sources', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi
+        .fn()
+        .mockResolvedValue([{ title: 'A', url: 'https://a.example', snippet: '' }]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
+
+    await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    const messageCreate = mockedPrisma.message.create.mock.calls.find(
+      (call) => {
+        const data = (call[0] as { data?: { metadata?: { kind?: string } } }).data;
+        return data?.metadata?.kind === 'research_failed';
+      },
+    );
+    expect(messageCreate).toBeDefined();
+    const data = (messageCreate![0] as { data: { role: string; metadata: { kind: string; reason: string } } }).data;
+    expect(data.role).toBe('assistant');
+    expect(data.metadata.kind).toBe('research_failed');
+    expect(data.metadata.reason).toMatch(/source/i);
+  });
+
+  it('creates a research_failed message when planning LLM throws', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    mockedGenerate.mockRejectedValueOnce(new Error('planning down'));
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ai-error');
+    const messageCreate = mockedPrisma.message.create.mock.calls.find(
+      (call) => {
+        const data = (call[0] as { data?: { metadata?: { kind?: string } } }).data;
+        return data?.metadata?.kind === 'research_failed';
+      },
+    );
+    expect(messageCreate).toBeDefined();
   });
 });
 

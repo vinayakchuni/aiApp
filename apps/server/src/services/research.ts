@@ -1,6 +1,7 @@
 import { prisma } from '../lib/db';
 import { Prisma } from '../generated/prisma/client';
 import { generateAssistantText } from './ai';
+import { sendResearchCompleteEmail } from './email';
 import { DEFAULT_MODEL_ID, isSupportedModel } from './models';
 import type { LLMMessage } from './context';
 import {
@@ -10,6 +11,22 @@ import {
   type SearchResult,
   type SearchService,
 } from './search';
+
+const activeResearchUsers = new Set<string>();
+
+export function isResearchActiveForUser(userId: string): boolean {
+  return activeResearchUsers.has(userId);
+}
+
+// Exposed for tests to reset state between cases.
+export function _resetActiveResearch(): void {
+  activeResearchUsers.clear();
+}
+
+// Exposed for tests to hold the mutex without running the pipeline.
+export function _acquireActiveResearch(userId: string): void {
+  activeResearchUsers.add(userId);
+}
 
 export const CLARIFYING_QUESTION_COUNT = 4;
 export const MIN_SOURCES_REQUIRED = 3;
@@ -1028,6 +1045,7 @@ export type RunResearchOutcome =
     }
   | { kind: 'not-found' }
   | { kind: 'wrong-status' }
+  | { kind: 'busy' }
   | { kind: 'insufficient-sources'; sourcesFound: number }
   | { kind: 'search-failed'; message: string }
   | { kind: 'ai-error'; message: string }
@@ -1051,18 +1069,49 @@ function readyMessageSummary(metadata: unknown): string | null {
   return null;
 }
 
-async function markFailed(conversationId: string): Promise<void> {
+async function markFailed(conversationId: string, message?: string): Promise<void> {
   try {
     await prisma.conversation.update({
       where: { id: conversationId },
       data: { researchStatus: 'failed', updatedAt: new Date() },
     });
+    if (message) {
+      await prisma.message
+        .create({
+          data: {
+            conversationId,
+            role: 'assistant',
+            content: message,
+            metadata: {
+              kind: 'research_failed',
+              reason: message,
+            } as Prisma.InputJsonValue,
+          },
+        })
+        .catch((err) => console.error('Failed to persist failure message:', err));
+    }
   } catch (err) {
     console.error('Failed to mark research as failed:', err);
   }
 }
 
 export async function runResearchPipeline(
+  options: RunResearchOptions,
+): Promise<RunResearchOutcome> {
+  const { userId } = options;
+
+  if (activeResearchUsers.has(userId)) {
+    return { kind: 'busy' };
+  }
+  activeResearchUsers.add(userId);
+  try {
+    return await runResearchPipelineImpl(options);
+  } finally {
+    activeResearchUsers.delete(userId);
+  }
+}
+
+async function runResearchPipelineImpl(
   options: RunResearchOptions,
 ): Promise<RunResearchOutcome> {
   const { userId, conversationId, onProgress, abortSignal } = options;
@@ -1074,7 +1123,7 @@ export async function runResearchPipeline(
       userId: true,
       mode: true,
       researchStatus: true,
-      user: { select: { preferredModel: true } },
+      user: { select: { preferredModel: true, email: true } },
     },
   });
   if (!conversation || conversation.userId !== userId) {
@@ -1087,6 +1136,7 @@ export async function runResearchPipeline(
   if (abortSignal?.aborted) return { kind: 'aborted' };
 
   const modelId = modelIdFor(conversation.user?.preferredModel);
+  const userEmail = conversation.user?.email ?? null;
 
   const history = await prisma.message.findMany({
     where: { conversationId },
@@ -1160,7 +1210,10 @@ export async function runResearchPipeline(
     queriesText = await generateAssistantText(planningMessages, modelId);
   } catch (err) {
     console.error('Search-query planning failed:', err);
-    await markFailed(conversationId);
+    await markFailed(
+      conversationId,
+      'Research could not start because the AI provider failed while planning searches. Please try again.',
+    );
     return { kind: 'ai-error', message: 'Could not plan searches.' };
   }
 
@@ -1172,7 +1225,10 @@ export async function runResearchPipeline(
     researchFiles,
   );
   if (queries.length === 0) {
-    await markFailed(conversationId);
+    await markFailed(
+      conversationId,
+      'Research could not start because the AI provider did not return any search queries. Please rephrase the topic and try again.',
+    );
     return { kind: 'ai-error', message: 'Could not plan searches.' };
   }
 
@@ -1209,13 +1265,20 @@ export async function runResearchPipeline(
   }
 
   if (sources.length < MIN_SOURCES_REQUIRED) {
-    await markFailed(conversationId);
     if (providerErrors >= queries.length) {
+      await markFailed(
+        conversationId,
+        'Research failed: every web search provider returned an error. Please try again later.',
+      );
       return {
         kind: 'search-failed',
         message: 'All web search providers failed. Please try again later.',
       };
     }
+    await markFailed(
+      conversationId,
+      `Research could not produce a draft because only ${sources.length} source(s) were gathered. Please rephrase the topic and try again.`,
+    );
     return { kind: 'insufficient-sources', sourcesFound: sources.length };
   }
 
@@ -1250,7 +1313,10 @@ export async function runResearchPipeline(
     );
   } catch (err) {
     console.error('Draft generation failed:', err);
-    await markFailed(conversationId);
+    await markFailed(
+      conversationId,
+      'Research failed: the AI provider could not write the first draft. Please try again.',
+    );
     return { kind: 'ai-error', message: 'Could not write the draft.' };
   }
 
@@ -1301,7 +1367,10 @@ export async function runResearchPipeline(
       );
     } catch (err) {
       console.error(`Critique generation failed at iteration ${i}:`, err);
-      await markFailed(conversationId);
+      await markFailed(
+        conversationId,
+        'Research failed: the AI provider could not critique the draft. Please try again.',
+      );
       return { kind: 'ai-error', message: 'Could not critique the draft.' };
     }
 
@@ -1414,7 +1483,10 @@ export async function runResearchPipeline(
       );
     } catch (err) {
       console.error(`Revision generation failed at iteration ${i}:`, err);
-      await markFailed(conversationId);
+      await markFailed(
+        conversationId,
+        'Research failed: the AI provider could not revise the draft. Please try again.',
+      );
       return { kind: 'ai-error', message: 'Could not revise the draft.' };
     }
 
@@ -1486,6 +1558,16 @@ export async function runResearchPipeline(
     where: { id: conversationId },
     data: { researchStatus: 'complete', updatedAt: new Date() },
   });
+
+  const emailTopic = updatedConversation.title || topic;
+  if (userEmail) {
+    sendResearchCompleteEmail({
+      email: userEmail,
+      conversationId,
+      topic: emailTopic,
+      report: structuredReport,
+    }).catch((err) => console.error('Research-complete email failed:', err));
+  }
 
   return {
     kind: 'ok',

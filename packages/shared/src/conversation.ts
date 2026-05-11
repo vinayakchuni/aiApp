@@ -118,6 +118,7 @@ export type MessageMetadata =
       llmCallsUsed: number;
       report?: StructuredReport;
     }
+  | { kind: 'research_failed'; reason: string }
   | { kind: string; [key: string]: unknown };
 
 export type ResearchProgressStage =
@@ -152,6 +153,7 @@ export interface ResearchFailedEvent {
   code:
     | 'NOT_FOUND'
     | 'WRONG_STATUS'
+    | 'RESEARCH_BUSY'
     | 'INSUFFICIENT_SOURCES'
     | 'SEARCH_FAILED'
     | 'AI_ERROR';
