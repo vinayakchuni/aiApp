@@ -847,6 +847,94 @@ export function computeReportMethodology(
   };
 }
 
+export interface TraceFactCheckRollup {
+  totalClaimsExtracted: number;
+  verifiedClaims: number;
+  unverifiedClaims: number;
+  notCheckedClaims: number;
+  searchesUsed: number;
+  budgetExhausted: boolean;
+}
+
+export function aggregateFactCheckRollup(
+  iterations: CritiqueIterationRecord[],
+): TraceFactCheckRollup {
+  let total = 0;
+  let verified = 0;
+  let unverified = 0;
+  let notChecked = 0;
+  let searchesUsed = 0;
+  let budgetExhausted = false;
+  for (const it of iterations) {
+    if (!it.factCheck) continue;
+    total += it.factCheck.results.length;
+    for (const r of it.factCheck.results) {
+      if (r.status === 'verified') verified += 1;
+      else if (r.status === 'unverified') unverified += 1;
+      else notChecked += 1;
+    }
+    searchesUsed += it.factCheck.searchesUsed;
+    if (it.factCheck.budgetExhausted) budgetExhausted = true;
+  }
+  return {
+    totalClaimsExtracted: total,
+    verifiedClaims: verified,
+    unverifiedClaims: unverified,
+    notCheckedClaims: notChecked,
+    searchesUsed,
+    budgetExhausted,
+  };
+}
+
+export interface CitedSource {
+  index: number;
+  title: string;
+  url: string;
+  cited: boolean;
+}
+
+export interface SourceCitationRollup {
+  sources: CitedSource[];
+  total: number;
+  cited: number;
+}
+
+export function parseCitedIndexes(text: string): Set<number> {
+  const out = new Set<number>();
+  const re = /\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    for (const piece of match[1].split(',')) {
+      const n = Number.parseInt(piece.trim(), 10);
+      if (Number.isFinite(n) && n > 0) out.add(n);
+    }
+  }
+  return out;
+}
+
+export function computeSourceCitationRollup(
+  sources: SearchResult[],
+  report: StructuredReport,
+): SourceCitationRollup {
+  const corpus = [
+    report.executiveSummary,
+    ...report.keyFindings,
+    report.detailedAnalysis,
+  ].join('\n');
+  const citedIndexes = parseCitedIndexes(corpus);
+  const out: CitedSource[] = sources.map((s, i) => ({
+    index: i + 1,
+    title: s.title,
+    url: s.url,
+    cited: citedIndexes.has(i + 1),
+  }));
+  return {
+    sources: out,
+    total: sources.length,
+    cited: out.filter((s) => s.cited).length,
+  };
+}
+
 const FALLBACK_EXECUTIVE_SUMMARY_SENTENCES = 2;
 
 export function programmaticReportFromDraft(
@@ -1809,6 +1897,9 @@ async function runResearchPipelineImpl(
     }).catch((err) => console.error('Research-complete email failed:', err));
   }
 
+  const factCheckSummary = aggregateFactCheckRollup(iterations);
+  const sourceCitation = computeSourceCitationRollup(sources, structuredReport);
+
   traceFinalize = {
     exitReason,
     output: {
@@ -1824,6 +1915,9 @@ async function runResearchPipelineImpl(
       iterationCount: iterations.length,
       llmCallsUsed,
       sourceCount: sources.length,
+      citedSourceCount: sourceCitation.cited,
+      sourceCitation,
+      factCheckSummary,
       ...(finalScores ? { finalScores } : {}),
     },
   };

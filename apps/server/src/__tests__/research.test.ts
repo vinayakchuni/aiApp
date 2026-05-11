@@ -174,6 +174,9 @@ import {
   computeReportMethodology,
   programmaticReportFromDraft,
   buildStructuredReport,
+  aggregateFactCheckRollup,
+  parseCitedIndexes,
+  computeSourceCitationRollup,
   getLatestResearchFinal,
   isResearchActiveForUser,
   _resetActiveResearch,
@@ -1998,6 +2001,227 @@ describe('computeReportMethodology', () => {
   });
 });
 
+describe('aggregateFactCheckRollup', () => {
+  it('returns zeros when no iterations have fact-check data', () => {
+    const rollup = aggregateFactCheckRollup([]);
+    expect(rollup).toEqual({
+      totalClaimsExtracted: 0,
+      verifiedClaims: 0,
+      unverifiedClaims: 0,
+      notCheckedClaims: 0,
+      searchesUsed: 0,
+      budgetExhausted: false,
+    });
+  });
+
+  it('sums claims, statuses, and searches across iterations', () => {
+    const rollup = aggregateFactCheckRollup([
+      {
+        iteration: 1,
+        scores: {
+          factual_accuracy: 3,
+          completeness: 3,
+          source_coverage: 3,
+          coherence: 3,
+          scope_alignment: 3,
+        },
+        critique: 'c',
+        weakest: [],
+        revised: true,
+        factCheck: {
+          results: [
+            { claim: '1', status: 'verified', supportingUrls: ['https://a'] },
+            { claim: '2', status: 'unverified', supportingUrls: [] },
+          ],
+          claimsExtracted: 2,
+          searchesUsed: 2,
+          budgetExhausted: false,
+        },
+      },
+      {
+        iteration: 2,
+        scores: {
+          factual_accuracy: 4,
+          completeness: 4,
+          source_coverage: 4,
+          coherence: 4,
+          scope_alignment: 4,
+        },
+        critique: 'c2',
+        weakest: [],
+        revised: false,
+        factCheck: {
+          results: [
+            { claim: '3', status: 'verified', supportingUrls: ['https://b'] },
+            { claim: '4', status: 'not_checked', supportingUrls: [] },
+          ],
+          claimsExtracted: 2,
+          searchesUsed: 1,
+          budgetExhausted: true,
+        },
+      },
+    ]);
+    expect(rollup).toEqual({
+      totalClaimsExtracted: 4,
+      verifiedClaims: 2,
+      unverifiedClaims: 1,
+      notCheckedClaims: 1,
+      searchesUsed: 3,
+      budgetExhausted: true,
+    });
+  });
+
+  it('skips iterations without fact-check data', () => {
+    const rollup = aggregateFactCheckRollup([
+      {
+        iteration: 1,
+        scores: {
+          factual_accuracy: 3,
+          completeness: 3,
+          source_coverage: 3,
+          coherence: 3,
+          scope_alignment: 3,
+        },
+        critique: 'c',
+        weakest: [],
+        revised: false,
+      },
+      {
+        iteration: 2,
+        scores: {
+          factual_accuracy: 4,
+          completeness: 4,
+          source_coverage: 4,
+          coherence: 4,
+          scope_alignment: 4,
+        },
+        critique: 'c2',
+        weakest: [],
+        revised: false,
+        factCheck: {
+          results: [{ claim: 'x', status: 'verified', supportingUrls: [] }],
+          claimsExtracted: 1,
+          searchesUsed: 1,
+          budgetExhausted: false,
+        },
+      },
+    ]);
+    expect(rollup.totalClaimsExtracted).toBe(1);
+    expect(rollup.searchesUsed).toBe(1);
+    expect(rollup.budgetExhausted).toBe(false);
+  });
+});
+
+describe('parseCitedIndexes', () => {
+  it('extracts single-number citations like [1]', () => {
+    expect(parseCitedIndexes('Some text [1] and [3].')).toEqual(new Set([1, 3]));
+  });
+
+  it('extracts comma-separated citations like [1, 2]', () => {
+    expect(parseCitedIndexes('Findings [1, 2, 5] support this.')).toEqual(
+      new Set([1, 2, 5]),
+    );
+  });
+
+  it('returns an empty set when no bracketed citations are present', () => {
+    expect(parseCitedIndexes('No citations here, just prose.')).toEqual(new Set());
+  });
+
+  it('does not match bracketed non-numeric content', () => {
+    expect(parseCitedIndexes('See [note] for context.')).toEqual(new Set());
+  });
+
+  it('deduplicates repeated citation numbers', () => {
+    expect(parseCitedIndexes('A [1] B [1] C [2] D [1].')).toEqual(new Set([1, 2]));
+  });
+});
+
+describe('computeSourceCitationRollup', () => {
+  const sources = [
+    { title: 'A', url: 'https://a.example', snippet: '' },
+    { title: 'B', url: 'https://b.example', snippet: '' },
+    { title: 'C', url: 'https://c.example', snippet: '' },
+  ];
+
+  function buildReport(detailedAnalysis: string, keyFindings: string[] = []) {
+    return {
+      executiveSummary: '',
+      keyFindings,
+      detailedAnalysis,
+      sources: [],
+      methodology: {
+        queries: [],
+        iterationCount: 0,
+        finalScores: null,
+        factCheckSummary: {
+          totalClaimsExtracted: 0,
+          verifiedClaims: 0,
+          unverifiedClaims: 0,
+          notCheckedClaims: 0,
+        },
+      },
+    };
+  }
+
+  it('marks sources cited when their index appears in the detailed analysis', () => {
+    const rollup = computeSourceCitationRollup(
+      sources,
+      buildReport('The findings combine [1] with [3].'),
+    );
+    expect(rollup.total).toBe(3);
+    expect(rollup.cited).toBe(2);
+    expect(rollup.sources.map((s) => ({ url: s.url, cited: s.cited }))).toEqual([
+      { url: 'https://a.example', cited: true },
+      { url: 'https://b.example', cited: false },
+      { url: 'https://c.example', cited: true },
+    ]);
+  });
+
+  it('scans key findings and executive summary as well, not just detailed analysis', () => {
+    const report = {
+      executiveSummary: 'Summary references [2].',
+      keyFindings: ['Finding with [1].'],
+      detailedAnalysis: 'Body without citations.',
+      sources: [],
+      methodology: {
+        queries: [],
+        iterationCount: 0,
+        finalScores: null,
+        factCheckSummary: {
+          totalClaimsExtracted: 0,
+          verifiedClaims: 0,
+          unverifiedClaims: 0,
+          notCheckedClaims: 0,
+        },
+      },
+    };
+    const rollup = computeSourceCitationRollup(sources, report);
+    expect(rollup.cited).toBe(2);
+    const byIndex = Object.fromEntries(rollup.sources.map((s) => [s.index, s.cited]));
+    expect(byIndex[1]).toBe(true);
+    expect(byIndex[2]).toBe(true);
+    expect(byIndex[3]).toBe(false);
+  });
+
+  it('marks all sources uncited when no citations are present', () => {
+    const rollup = computeSourceCitationRollup(
+      sources,
+      buildReport('Plain text, no citations.'),
+    );
+    expect(rollup.total).toBe(3);
+    expect(rollup.cited).toBe(0);
+    expect(rollup.sources.every((s) => !s.cited)).toBe(true);
+  });
+
+  it('ignores citation indexes that exceed the number of fetched sources', () => {
+    const rollup = computeSourceCitationRollup(
+      sources,
+      buildReport('Reference [9] does not exist in the source list.'),
+    );
+    expect(rollup.cited).toBe(0);
+  });
+});
+
 describe('programmaticReportFromDraft', () => {
   it('falls back to draft-based sections when LLM is unavailable', () => {
     const report = programmaticReportFromDraft(
@@ -3446,6 +3670,150 @@ describe('runResearchPipeline tracing instrumentation', () => {
     expect(finish.exitReason).toBe('critique_parse_failed');
     // No critique parsed -> no finalScores to attach.
     expect(finish.metadata).not.toHaveProperty('finalScores');
+  });
+
+  it('attaches a fact-check rollup to trace finish metadata after one fact-check round', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim one.\nClaim two.')
+      .mockResolvedValueOnce('Revised draft with very different wording entirely.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const finish = traceFinishes[0] as {
+      metadata?: { factCheckSummary?: Record<string, unknown> };
+    };
+    const summary = finish.metadata?.factCheckSummary;
+    expect(summary).toBeDefined();
+    expect(summary?.totalClaimsExtracted).toBe(2);
+    // Both claims found sources via the fake search service → both verified.
+    expect(summary?.verifiedClaims).toBe(2);
+    expect(summary?.unverifiedClaims).toBe(0);
+    expect(summary?.notCheckedClaims).toBe(0);
+    expect(typeof summary?.searchesUsed).toBe('number');
+    expect(summary?.budgetExhausted).toBe(false);
+  });
+
+  it('attaches a zeroed fact-check rollup when no fact-check round runs (all_passed on first critique)', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const finish = traceFinishes[0] as {
+      metadata?: { factCheckSummary?: Record<string, unknown> };
+    };
+    expect(finish.metadata?.factCheckSummary).toEqual({
+      totalClaimsExtracted: 0,
+      verifiedClaims: 0,
+      unverifiedClaims: 0,
+      notCheckedClaims: 0,
+      searchesUsed: 0,
+      budgetExhausted: false,
+    });
+  });
+
+  it('attaches per-source cited flags and a cited count to trace finish metadata', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const finish = traceFinishes[0] as {
+      metadata?: {
+        sourceCitation?: {
+          sources: { index: number; url: string; cited: boolean }[];
+          total: number;
+          cited: number;
+        };
+        citedSourceCount?: number;
+        sourceCount?: number;
+      };
+    };
+    const rollup = finish.metadata?.sourceCitation;
+    expect(rollup).toBeDefined();
+    expect(rollup?.total).toBe(3);
+    // MOCK_REPORT references [1], [2], and [3] across findings + analysis.
+    expect(rollup?.cited).toBe(3);
+    expect(finish.metadata?.citedSourceCount).toBe(3);
+    expect(finish.metadata?.sourceCount).toBe(3);
+    expect(rollup?.sources.map((s) => s.cited)).toEqual([true, true, true]);
+    expect(rollup?.sources.map((s) => s.index)).toEqual([1, 2, 3]);
+  });
+
+  it('marks uncited sources as cited=false when the report does not reference them', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(`EXECUTIVE_SUMMARY:
+Plain summary with no citations.
+
+KEY_FINDINGS:
+- Finding one.
+- Finding two referencing [1].
+
+DETAILED_ANALYSIS:
+Detailed body referencing [1] only.`);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const finish = traceFinishes[0] as {
+      metadata?: {
+        sourceCitation?: {
+          sources: { index: number; cited: boolean }[];
+          total: number;
+          cited: number;
+        };
+        citedSourceCount?: number;
+      };
+    };
+    expect(finish.metadata?.sourceCitation?.cited).toBe(1);
+    expect(finish.metadata?.citedSourceCount).toBe(1);
+    const byIndex = Object.fromEntries(
+      (finish.metadata?.sourceCitation?.sources ?? []).map((s) => [s.index, s.cited]),
+    );
+    expect(byIndex[1]).toBe(true);
+    expect(byIndex[2]).toBe(false);
+    expect(byIndex[3]).toBe(false);
+  });
+
+  it('omits fact-check and citation rollups on failure paths that exit before the report', async () => {
+    setupOk();
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+      ]),
+    } as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('insufficient-sources');
+
+    const finish = traceFinishes[0] as { metadata?: Record<string, unknown> };
+    const metadata = finish.metadata ?? {};
+    expect(metadata).not.toHaveProperty('factCheckSummary');
+    expect(metadata).not.toHaveProperty('sourceCitation');
+    expect(metadata).not.toHaveProperty('citedSourceCount');
   });
 });
 
