@@ -1565,6 +1565,11 @@ async function runResearchPipelineImpl(
     };
     iterations.push(record);
     finalScores = parsed.scores;
+    for (const criterion of CRITIQUE_CRITERIA) {
+      trace.score(`critique_${criterion}`, parsed.scores[criterion], {
+        metadata: { iteration: i, maxIterations },
+      });
+    }
     critiqueSpan.end({
       metadata: { iteration: i, scores: parsed.scores, weakest },
       output: { scores: parsed.scores, critique: parsed.critique },
@@ -1819,6 +1824,7 @@ async function runResearchPipelineImpl(
       iterationCount: iterations.length,
       llmCallsUsed,
       sourceCount: sources.length,
+      ...(finalScores ? { finalScores } : {}),
     },
   };
 

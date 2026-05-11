@@ -94,6 +94,14 @@ export interface FinishTraceOptions {
   error?: string;
 }
 
+export type ScoreDataType = 'NUMERIC' | 'BOOLEAN' | 'CATEGORICAL';
+
+export interface ScoreOptions {
+  comment?: string;
+  metadata?: Record<string, unknown>;
+  dataType?: ScoreDataType;
+}
+
 export interface TraceCostTotals {
   inputTokens: number;
   outputTokens: number;
@@ -110,6 +118,7 @@ export interface ResearchTrace {
   startGeneration(name: string, opts: StartGenerationOptions): GenerationSpan;
   updateMetadata(patch: Record<string, unknown>): void;
   markError(message: string): void;
+  score(name: string, value: number, opts?: ScoreOptions): void;
   finish(opts?: FinishTraceOptions): Promise<void>;
   getCostTotals(): TraceCostTotals;
 }
@@ -150,6 +159,7 @@ const noopTrace: ResearchTrace = {
   startGeneration: () => noopGeneration,
   updateMetadata() {},
   markError() {},
+  score() {},
   async finish() {},
   getCostTotals: () => zeroTotals,
 };
@@ -334,6 +344,20 @@ export function createResearchTrace(init: ResearchTraceInit): ResearchTrace {
           }),
         undefined,
         'trace.markError',
+      );
+    },
+    score(name, value, opts) {
+      safe(
+        () =>
+          void trace.score({
+            name,
+            value,
+            comment: opts?.comment,
+            metadata: opts?.metadata,
+            dataType: opts?.dataType ?? 'NUMERIC',
+          }),
+        undefined,
+        `trace.score(${name})`,
       );
     },
     getCostTotals: () => ({ ...totals }),

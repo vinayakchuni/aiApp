@@ -56,6 +56,11 @@ const traceFinishes: unknown[] = [];
 const traceMetadataUpdates: unknown[] = [];
 const traceErrors: string[] = [];
 const traceInits: unknown[] = [];
+const traceScores: {
+  name: string;
+  value: number;
+  opts?: { comment?: string; metadata?: Record<string, unknown>; dataType?: string };
+}[] = [];
 
 function clearTraceRecorder(): void {
   traceSpans.length = 0;
@@ -63,6 +68,7 @@ function clearTraceRecorder(): void {
   traceMetadataUpdates.length = 0;
   traceErrors.length = 0;
   traceInits.length = 0;
+  traceScores.length = 0;
 }
 
 const noopGen = { end: () => {} };
@@ -99,6 +105,15 @@ vi.mock('../services/tracing', () => ({
       },
       markError: (msg: string) => {
         traceErrors.push(msg);
+      },
+      score: (name: string, value: number, opts?: unknown) => {
+        traceScores.push({
+          name,
+          value,
+          opts: opts as
+            | { comment?: string; metadata?: Record<string, unknown>; dataType?: string }
+            | undefined,
+        });
       },
       finish: async (opts: unknown) => {
         traceFinishes.push(opts);
@@ -3303,6 +3318,134 @@ describe('runResearchPipeline tracing instrumentation', () => {
     expect(calls[3][2]?.generationMetadata).toEqual({ iteration: 1 });
     expect(calls[4][2]?.generationMetadata).toEqual({ iteration: 1 });
     expect(calls[5][2]?.generationMetadata).toEqual({ iteration: 2 });
+  });
+
+  it('pushes the 5 critique dimension scores to the trace after a critique parses (happy path)', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    expect(traceScores).toHaveLength(5);
+    const byName = Object.fromEntries(traceScores.map((s) => [s.name, s.value]));
+    expect(byName.critique_factual_accuracy).toBe(5);
+    expect(byName.critique_completeness).toBe(5);
+    expect(byName.critique_source_coverage).toBe(5);
+    expect(byName.critique_coherence).toBe(5);
+    expect(byName.critique_scope_alignment).toBe(5);
+    for (const s of traceScores) {
+      expect(s.opts?.metadata?.iteration).toBe(1);
+      expect(s.opts?.metadata?.maxIterations).toBe(5);
+    }
+
+    const finish = traceFinishes[0] as {
+      metadata?: Record<string, unknown>;
+      output?: { finalScores?: unknown };
+    };
+    expect(finish.metadata?.finalScores).toEqual({
+      factual_accuracy: 5,
+      completeness: 5,
+      source_coverage: 5,
+      coherence: 5,
+      scope_alignment: 5,
+    });
+    expect(finish.output?.finalScores).toBeDefined();
+  });
+
+  it('pushes critique scores per iteration with the iteration index in metadata', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
+      .mockResolvedValueOnce('Revised draft with very different wording entirely.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    expect(traceScores).toHaveLength(10);
+    const iter1 = traceScores.filter((s) => s.opts?.metadata?.iteration === 1);
+    const iter2 = traceScores.filter((s) => s.opts?.metadata?.iteration === 2);
+    expect(iter1).toHaveLength(5);
+    expect(iter2).toHaveLength(5);
+
+    const iter1ByName = Object.fromEntries(iter1.map((s) => [s.name, s.value]));
+    expect(iter1ByName.critique_factual_accuracy).toBe(4);
+    expect(iter1ByName.critique_completeness).toBe(2);
+    expect(iter1ByName.critique_source_coverage).toBe(3);
+
+    const iter2ByName = Object.fromEntries(iter2.map((s) => [s.name, s.value]));
+    expect(iter2ByName.critique_completeness).toBe(5);
+
+    // Scores are sortable in the dashboard by being separate score events;
+    // the orchestrator must not have collapsed them into a single update.
+    for (const s of traceScores) {
+      expect(typeof s.value).toBe('number');
+      expect(s.name.startsWith('critique_')).toBe(true);
+    }
+
+    const finish = traceFinishes[0] as { metadata?: { finalScores?: unknown } };
+    // finalScores reflects the LAST critique (iteration 2 = PERFECT_CRITIQUE).
+    expect(finish.metadata?.finalScores).toEqual({
+      factual_accuracy: 5,
+      completeness: 5,
+      source_coverage: 5,
+      coherence: 5,
+      scope_alignment: 5,
+    });
+  });
+
+  it('records draft similarity on the revising span metadata', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
+      .mockResolvedValueOnce('Revised draft with very different wording entirely.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const revise = traceSpans.find((s) => s.name === 'revising');
+    expect(revise).toBeDefined();
+    const meta = (revise?.endOpts as { metadata?: Record<string, unknown> } | undefined)
+      ?.metadata;
+    expect(meta?.iteration).toBe(1);
+    expect(typeof meta?.similarity).toBe('number');
+    expect(meta?.similarity).toBeGreaterThanOrEqual(0);
+    expect(meta?.similarity).toBeLessThanOrEqual(1);
+  });
+
+  it('does not push scores when the critique parse fails', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce('garbage that is not a critique')
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    expect(traceScores).toHaveLength(0);
+    const finish = traceFinishes[0] as {
+      exitReason?: string;
+      metadata?: Record<string, unknown>;
+    };
+    expect(finish.exitReason).toBe('critique_parse_failed');
+    // No critique parsed -> no finalScores to attach.
+    expect(finish.metadata).not.toHaveProperty('finalScores');
   });
 });
 

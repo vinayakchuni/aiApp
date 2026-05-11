@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('langfuse', () => {
   const traceUpdate = vi.fn();
+  const traceScore = vi.fn();
   const spanUpdate = vi.fn();
   const spanEnd = vi.fn();
   const generationEnd = vi.fn();
@@ -26,6 +27,7 @@ vi.mock('langfuse', () => {
     update: traceUpdate,
     span: traceSpan,
     generation: traceGeneration,
+    score: traceScore,
   }));
   class FakeLangfuse {
     trace = traceCreate;
@@ -35,6 +37,7 @@ vi.mock('langfuse', () => {
     Langfuse: FakeLangfuse,
     __mocks: {
       traceUpdate,
+      traceScore,
       spanUpdate,
       spanEnd,
       traceSpan,
@@ -60,6 +63,7 @@ import * as langfuseMock from 'langfuse';
 const mocks = (langfuseMock as unknown as {
   __mocks: {
     traceUpdate: ReturnType<typeof vi.fn>;
+    traceScore: ReturnType<typeof vi.fn>;
     spanUpdate: ReturnType<typeof vi.fn>;
     spanEnd: ReturnType<typeof vi.fn>;
     traceSpan: ReturnType<typeof vi.fn>;
@@ -79,6 +83,7 @@ describe('tracing service', () => {
 
   beforeEach(() => {
     mocks.traceUpdate.mockReset();
+    mocks.traceScore.mockReset();
     mocks.spanUpdate.mockReset();
     mocks.spanEnd.mockReset();
     mocks.generationEnd.mockReset();
@@ -109,6 +114,7 @@ describe('tracing service', () => {
       update: mocks.traceUpdate,
       span: mocks.traceSpan,
       generation: mocks.traceGeneration,
+      score: mocks.traceScore,
     }));
     _resetLangfuseClient();
     delete process.env.LANGFUSE_PUBLIC_KEY;
@@ -505,6 +511,47 @@ describe('tracing service', () => {
       expect(() => child.end({ metadata: { resultCount: 1 } })).not.toThrow();
     });
 
+    it('trace.score forwards a numeric score to the SDK with metadata + comment', () => {
+      const trace = createResearchTrace({
+        userId: 'u',
+        conversationId: 'c',
+        topic: 't',
+        modelId: 'openai:gpt-4o-mini',
+        clarifyingAnswers: [],
+      });
+      trace.score('critique_factual_accuracy', 4, {
+        metadata: { iteration: 2, maxIterations: 5 },
+        comment: 'iteration 2',
+      });
+      expect(mocks.traceScore).toHaveBeenCalledTimes(1);
+      const args = mocks.traceScore.mock.calls[0][0] as {
+        name: string;
+        value: number;
+        comment?: string;
+        metadata: Record<string, unknown>;
+        dataType: string;
+      };
+      expect(args.name).toBe('critique_factual_accuracy');
+      expect(args.value).toBe(4);
+      expect(args.comment).toBe('iteration 2');
+      expect(args.metadata).toEqual({ iteration: 2, maxIterations: 5 });
+      expect(args.dataType).toBe('NUMERIC');
+    });
+
+    it('isolates trace.score SDK throws so the pipeline keeps running', () => {
+      mocks.traceScore.mockImplementationOnce(() => {
+        throw new Error('langfuse score down');
+      });
+      const trace = createResearchTrace({
+        userId: 'u',
+        conversationId: 'c',
+        topic: 't',
+        modelId: 'openai:gpt-4o-mini',
+        clarifyingAnswers: [],
+      });
+      expect(() => trace.score('critique_factual_accuracy', 4)).not.toThrow();
+    });
+
     it('trace.startGeneration attaches a generation directly to the trace', () => {
       const trace = createResearchTrace({
         userId: 'u',
@@ -543,6 +590,20 @@ describe('tracing service', () => {
         totalCost: 0,
         generations: 0,
       });
+    });
+
+    it('trace.score is a no-op when tracing is unconfigured', () => {
+      const trace = createResearchTrace({
+        userId: 'u',
+        conversationId: 'c',
+        topic: 't',
+        modelId: 'openai:gpt-4o-mini',
+        clarifyingAnswers: [],
+      });
+      expect(() =>
+        trace.score('critique_completeness', 5, { metadata: { iteration: 1 } }),
+      ).not.toThrow();
+      expect(mocks.traceScore).not.toHaveBeenCalled();
     });
 
     it('returns a no-op nested span when tracing is unconfigured', () => {
