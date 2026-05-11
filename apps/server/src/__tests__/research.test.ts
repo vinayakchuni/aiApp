@@ -66,8 +66,32 @@ import {
   parseRequestedFiles,
   matchRequestedFiles,
   runResearchPipeline,
+  parseCritique,
+  weakestCriteria,
+  allCriteriaPassed,
+  draftSimilarity,
 } from '../services/research';
 import { createSearchService, SearchProviderError } from '../services/search';
+
+const PERFECT_CRITIQUE = `SCORES:
+factual_accuracy: 5
+completeness: 5
+source_coverage: 5
+coherence: 5
+scope_alignment: 5
+
+CRITIQUE:
+Strong draft, nothing to improve.`;
+
+const FAILING_CRITIQUE = `SCORES:
+factual_accuracy: 4
+completeness: 2
+source_coverage: 3
+coherence: 4
+scope_alignment: 4
+
+CRITIQUE:
+Completeness is thin and source coverage is uneven.`;
 
 const mockedPrisma = vi.mocked(prisma);
 const mockedGenerate = vi.mocked(generateAssistantText);
@@ -716,7 +740,8 @@ describe('runResearchPipeline', () => {
 
     mockedGenerate
       .mockResolvedValueOnce('eu agriculture climate impacts\nheat stress crops eu')
-      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].');
+      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
 
     const fakeSearch = {
       remaining: vi.fn().mockReturnValue(20),
@@ -773,21 +798,32 @@ describe('runResearchPipeline', () => {
 
     // Persisted with metadata
     const draftCreate = mockedPrisma.message.create.mock.calls[0][0] as {
-      data: { metadata: { kind: string; queries: string[]; sources: unknown[] } };
+      data: {
+        metadata: {
+          kind: string;
+          queries: string[];
+          sources: unknown[];
+          iterations: unknown[];
+          exitReason: string;
+        };
+      };
     };
-    expect(draftCreate.data.metadata.kind).toBe('research_draft');
+    expect(draftCreate.data.metadata.kind).toBe('research_final');
     expect(draftCreate.data.metadata.queries).toEqual([
       'eu agriculture climate impacts',
       'heat stress crops eu',
     ]);
     expect(draftCreate.data.metadata.sources).toHaveLength(3);
+    // One critique iteration, all scores 5/5 → exit reason is all_passed, no revisions
+    expect(draftCreate.data.metadata.iterations).toHaveLength(1);
+    expect(draftCreate.data.metadata.exitReason).toBe('all_passed');
 
     expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
       where: { id: 'conv-1' },
       data: { researchStatus: 'complete', updatedAt: expect.any(Date) },
     });
 
-    // Progress events covered all stages in order
+    // Progress events covered all stages including the first critique round
     const stages = progressEvents.map((p) => p.stage);
     expect(stages).toEqual([
       'generating_queries',
@@ -795,6 +831,7 @@ describe('runResearchPipeline', () => {
       'searching',
       'analyzing_sources',
       'writing_draft',
+      'critiquing',
     ]);
   });
 
@@ -887,7 +924,8 @@ describe('runResearchPipeline', () => {
       .mockResolvedValueOnce(
         'eu climate policy\nheat stress crops\nREAD_FILE: climate-report.pdf',
       )
-      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].');
+      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
 
     const fakeSearch = {
       remaining: vi.fn().mockReturnValue(20),
@@ -950,7 +988,7 @@ describe('runResearchPipeline', () => {
         };
       };
     };
-    expect(draftCreate.data.metadata.kind).toBe('research_draft');
+    expect(draftCreate.data.metadata.kind).toBe('research_final');
     expect(draftCreate.data.metadata.documents).toEqual([
       { id: 'f-1', originalName: 'climate-report.pdf', hadSummary: true, fullTextIncluded: true },
       { id: 'f-2', originalName: 'misc.txt', hadSummary: true, fullTextIncluded: false },
@@ -973,6 +1011,348 @@ describe('runResearchPipeline', () => {
     };
     mockedCreateSearchService.mockReturnValue(fakeSearch as never);
     mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ai-error');
+    expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
+    });
+    expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('Critique parsing and helpers', () => {
+  it('parseCritique extracts five scores and the critique body', () => {
+    const out = parseCritique(`SCORES:
+factual_accuracy: 4
+completeness: 3
+source_coverage: 5
+coherence: 4
+scope_alignment: 2
+
+CRITIQUE:
+Tighten the scope and broaden source diversity.`);
+    expect(out).not.toBeNull();
+    expect(out!.scores).toEqual({
+      factual_accuracy: 4,
+      completeness: 3,
+      source_coverage: 5,
+      coherence: 4,
+      scope_alignment: 2,
+    });
+    expect(out!.critique).toBe('Tighten the scope and broaden source diversity.');
+  });
+
+  it('parseCritique returns null when a criterion is missing', () => {
+    expect(
+      parseCritique(`SCORES:
+factual_accuracy: 4
+completeness: 3
+source_coverage: 5
+
+CRITIQUE:
+Body.`),
+    ).toBeNull();
+  });
+
+  it('parseCritique clamps out-of-range scores into 1-5', () => {
+    const out = parseCritique(`factual_accuracy: 9
+completeness: 0
+source_coverage: 3
+coherence: 4
+scope_alignment: 4
+CRITIQUE: x`);
+    expect(out!.scores.factual_accuracy).toBe(5);
+    expect(out!.scores.completeness).toBe(1);
+  });
+
+  it('weakestCriteria flags scores under the threshold', () => {
+    expect(
+      weakestCriteria({
+        factual_accuracy: 5,
+        completeness: 3,
+        source_coverage: 2,
+        coherence: 4,
+        scope_alignment: 4,
+      }),
+    ).toEqual(['completeness', 'source_coverage']);
+  });
+
+  it('allCriteriaPassed is true only when every score is >= 4', () => {
+    expect(
+      allCriteriaPassed({
+        factual_accuracy: 4,
+        completeness: 4,
+        source_coverage: 4,
+        coherence: 4,
+        scope_alignment: 4,
+      }),
+    ).toBe(true);
+    expect(
+      allCriteriaPassed({
+        factual_accuracy: 4,
+        completeness: 4,
+        source_coverage: 4,
+        coherence: 4,
+        scope_alignment: 3,
+      }),
+    ).toBe(false);
+  });
+
+  it('draftSimilarity is 1 for identical strings and < 1 for divergent ones', () => {
+    expect(draftSimilarity('alpha beta gamma', 'alpha beta gamma')).toBe(1);
+    expect(
+      draftSimilarity('alpha beta gamma', 'completely different words entirely'),
+    ).toBeLessThan(0.2);
+  });
+});
+
+describe('runResearchPipeline critique + revision loop', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+    process.env.MAX_RESEARCH_ITERATIONS = '5';
+    process.env.MAX_LLM_CALLS_PER_RESEARCH = '10';
+  });
+
+  function setupConversation() {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+  }
+
+  function setupHistory() {
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Climate impacts on agriculture', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: scope',
+        metadata: { kind: 'research_ready', summary: 'scope' },
+      },
+    ] as never);
+  }
+
+  function setupSearch() {
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    return fakeSearch;
+  }
+
+  function setupPersistence() {
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-final',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'final',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+  }
+
+  it('exits with all_passed on first critique when scores are >= 4', async () => {
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.exitReason).toBe('all_passed');
+      expect(out.iterations).toHaveLength(1);
+      expect(out.iterations[0].revised).toBe(false);
+      expect(out.llmCallsUsed).toBe(3);
+    }
+    // 3 calls: planning, draft, one critique
+    expect(mockedGenerate).toHaveBeenCalledTimes(3);
+  });
+
+  it('runs critique → revise → critique and exits when scores pass', async () => {
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Revised draft with significantly more breadth and depth.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.exitReason).toBe('all_passed');
+      expect(out.iterations).toHaveLength(2);
+      expect(out.iterations[0].revised).toBe(true);
+      expect(out.iterations[0].weakest).toContain('completeness');
+      expect(out.iterations[1].revised).toBe(false);
+    }
+
+    const final = mockedPrisma.message.create.mock.calls[0][0] as {
+      data: { content: string; metadata: { iterationCount: number; exitReason: string } };
+    };
+    expect(final.data.content).toBe(
+      'Revised draft with significantly more breadth and depth.',
+    );
+    expect(final.data.metadata.iterationCount).toBe(2);
+    expect(final.data.metadata.exitReason).toBe('all_passed');
+  });
+
+  it('caps iterations at MAX_RESEARCH_ITERATIONS', async () => {
+    process.env.MAX_RESEARCH_ITERATIONS = '2';
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    // planning + draft + (critique fail + revise) + (critique fail) = 5 calls; 2 iterations capped
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Draft v1.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Draft v2 with very different wording entirely throughout.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.exitReason).toBe('iterations_exhausted');
+      expect(out.iterations).toHaveLength(2);
+    }
+    expect(mockedGenerate).toHaveBeenCalledTimes(5);
+  });
+
+  it('stops with budget_exhausted before exceeding MAX_LLM_CALLS_PER_RESEARCH', async () => {
+    // Budget 4 = planning + draft + 1 critique + 1 revise, no room for next critique
+    process.env.MAX_LLM_CALLS_PER_RESEARCH = '4';
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Draft v1.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Draft v2 with rewritten content throughout the body.');
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.exitReason).toBe('budget_exhausted');
+      expect(out.llmCallsUsed).toBeLessThanOrEqual(4);
+    }
+    expect(mockedGenerate).toHaveBeenCalledTimes(4);
+  });
+
+  it('exits with converged when revision text barely changes', async () => {
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    const draft = 'alpha beta gamma delta epsilon zeta eta theta iota kappa';
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce(draft)
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce(draft); // identical revision → similarity 1
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.exitReason).toBe('converged');
+      expect(out.iterations).toHaveLength(1);
+      expect(out.iterations[0].revised).toBe(true);
+    }
+  });
+
+  it('emits critiquing and revising progress events with iteration numbers', async () => {
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Draft v1.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Draft v2 with broader scope and richer sourcing.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+
+    const events: { stage: string; iteration?: number; weakestCriteria?: string[] }[] = [];
+    await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+      onProgress: (p) => events.push(p),
+    });
+
+    const critique1 = events.find((e) => e.stage === 'critiquing' && e.iteration === 1);
+    const revising1 = events.find((e) => e.stage === 'revising' && e.iteration === 1);
+    const critique2 = events.find((e) => e.stage === 'critiquing' && e.iteration === 2);
+    expect(critique1).toBeDefined();
+    expect(revising1).toBeDefined();
+    expect(revising1!.weakestCriteria).toContain('completeness');
+    expect(critique2).toBeDefined();
+  });
+
+  it('exits with critique_parse_failed if the critic produces unparseable output', async () => {
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    setupPersistence();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce('totally not a valid critique format');
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.exitReason).toBe('critique_parse_failed');
+      expect(out.iterations).toHaveLength(0);
+      expect(out.finalScores).toBeNull();
+    }
+  });
+
+  it('returns ai-error when critique LLM call throws', async () => {
+    setupConversation();
+    setupHistory();
+    setupSearch();
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockRejectedValueOnce(new Error('critique boom'));
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
     expect(out.kind).toBe('ai-error');
@@ -1016,7 +1396,10 @@ describe('POST /api/conversations/:id/research/run (SSE)', () => {
         metadata: { kind: 'research_ready', summary: 'scope' },
       },
     ] as never);
-    mockedGenerate.mockResolvedValueOnce('q1\nq2').mockResolvedValueOnce('Draft body.');
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Draft body.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
     const fakeSearch = {
       remaining: vi.fn().mockReturnValue(20),
       search: vi.fn().mockResolvedValue([

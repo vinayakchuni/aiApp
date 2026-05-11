@@ -1,4 +1,5 @@
 import { prisma } from '../lib/db';
+import { Prisma } from '../generated/prisma/client';
 import { generateAssistantText } from './ai';
 import { DEFAULT_MODEL_ID, isSupportedModel } from './models';
 import type { LLMMessage } from './context';
@@ -13,6 +14,50 @@ import {
 export const CLARIFYING_QUESTION_COUNT = 4;
 export const MIN_SOURCES_REQUIRED = 3;
 export const MAX_SEARCH_QUERIES = 5;
+
+const DEFAULT_MAX_RESEARCH_ITERATIONS = 5;
+const DEFAULT_MAX_LLM_CALLS_PER_RESEARCH = 10;
+
+export function getMaxResearchIterations(): number {
+  const raw = process.env.MAX_RESEARCH_ITERATIONS;
+  if (!raw) return DEFAULT_MAX_RESEARCH_ITERATIONS;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_RESEARCH_ITERATIONS;
+}
+
+export function getMaxLlmCallsPerResearch(): number {
+  const raw = process.env.MAX_LLM_CALLS_PER_RESEARCH;
+  if (!raw) return DEFAULT_MAX_LLM_CALLS_PER_RESEARCH;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_LLM_CALLS_PER_RESEARCH;
+}
+
+export const PASS_SCORE_THRESHOLD = 4;
+export const CONVERGENCE_SIMILARITY_THRESHOLD = 0.95;
+export const CRITIQUE_CRITERIA = [
+  'factual_accuracy',
+  'completeness',
+  'source_coverage',
+  'coherence',
+  'scope_alignment',
+] as const;
+export type CritiqueCriterion = (typeof CRITIQUE_CRITERIA)[number];
+export type CritiqueScores = Record<CritiqueCriterion, number>;
+
+export interface CritiqueIterationRecord {
+  iteration: number;
+  scores: CritiqueScores;
+  critique: string;
+  weakest: CritiqueCriterion[];
+  revised: boolean;
+}
+
+export type ResearchExitReason =
+  | 'all_passed'
+  | 'converged'
+  | 'iterations_exhausted'
+  | 'budget_exhausted'
+  | 'critique_parse_failed';
 
 const CLARIFYING_SYSTEM_PROMPT = `You are a research planning assistant. The user has just given you a research topic. Your job is to ask ${CLARIFYING_QUESTION_COUNT} concise clarifying questions covering scope, depth, focus, and intended audience or use case. Number the questions 1-${CLARIFYING_QUESTION_COUNT}. Do not start the research yet - only ask the questions. Do not include any preamble.`;
 
@@ -288,6 +333,28 @@ Respond with one search query per line. No numbering, no quotes, no preamble. Pl
 
 const DRAFT_SYSTEM_PROMPT = `You are a research analyst writing a balanced, evidence-based first draft. Use the supplied web sources AND any supplied document context. Cite web sources inline using bracketed numbers like [1], [2] that correspond to the numbered source list. When you reference an uploaded document, name it explicitly (e.g., "according to the uploaded document foo.pdf"). Aim for 500-800 words. Structure the draft with: a one-paragraph introduction, 3-5 key findings as a bulleted or numbered list with citations, and a brief conclusion. Do not invent facts; if the supplied material is silent on a sub-question, say so.`;
 
+const CRITIQUE_SYSTEM_PROMPT = `You are a senior research editor critiquing a draft research report. Evaluate the draft on EXACTLY these five criteria, each scored from 1 (poor) to 5 (excellent):
+
+1. factual_accuracy — are the claims well-supported by the supplied sources?
+2. completeness — does the draft cover the agreed scope thoroughly?
+3. source_coverage — are the supplied sources used and cited appropriately?
+4. coherence — is the writing clear, well-organized, and free of contradictions?
+5. scope_alignment — does the draft stay within the agreed research scope?
+
+Respond in EXACTLY this format and nothing else:
+
+SCORES:
+factual_accuracy: <integer 1-5>
+completeness: <integer 1-5>
+source_coverage: <integer 1-5>
+coherence: <integer 1-5>
+scope_alignment: <integer 1-5>
+
+CRITIQUE:
+<2-4 sentences identifying the most important issues to fix, focused on the lowest-scored criteria. Be specific.>`;
+
+const REVISE_SYSTEM_PROMPT = `You are the research analyst who wrote the previous draft. A senior editor has critiqued it. Rewrite the entire draft, addressing every issue raised in the critique. Keep the same structure (one-paragraph intro, 3-5 findings with citations, brief conclusion) and the same numbered citation style ([1], [2], etc.) referring to the same source list. Do not invent new sources. Do not include the critique or scores in your output — only the revised draft prose. Aim for 500-800 words.`;
+
 export function parseSearchQueries(text: string): string[] {
   const lines = text
     .split('\n')
@@ -383,13 +450,116 @@ export type ResearchProgressStage =
   | 'generating_queries'
   | 'searching'
   | 'analyzing_sources'
-  | 'writing_draft';
+  | 'writing_draft'
+  | 'critiquing'
+  | 'revising';
 
 export interface ResearchProgress {
   stage: ResearchProgressStage;
   detail?: string;
   query?: string;
   sourcesFound?: number;
+  iteration?: number;
+  maxIterations?: number;
+  weakestCriteria?: CritiqueCriterion[];
+  scores?: CritiqueScores;
+}
+
+export interface CritiqueParseResult {
+  scores: CritiqueScores;
+  critique: string;
+}
+
+export function parseCritique(text: string): CritiqueParseResult | null {
+  const scores: Partial<Record<CritiqueCriterion, number>> = {};
+  for (const criterion of CRITIQUE_CRITERIA) {
+    const re = new RegExp(`^\\s*${criterion}\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)`, 'im');
+    const match = text.match(re);
+    if (!match) return null;
+    const n = Number.parseFloat(match[1]);
+    if (!Number.isFinite(n)) return null;
+    const clamped = Math.max(1, Math.min(5, Math.round(n)));
+    scores[criterion] = clamped;
+  }
+  const critiqueMatch = text.match(/CRITIQUE\s*:\s*([\s\S]*)$/i);
+  const critique = critiqueMatch
+    ? critiqueMatch[1].trim()
+    : text
+        .split('\n')
+        .filter((l) => !/^\s*(?:factual_accuracy|completeness|source_coverage|coherence|scope_alignment|scores)\s*:/i.test(l))
+        .join('\n')
+        .trim();
+  return {
+    scores: scores as CritiqueScores,
+    critique,
+  };
+}
+
+export function weakestCriteria(
+  scores: CritiqueScores,
+  threshold: number = PASS_SCORE_THRESHOLD,
+): CritiqueCriterion[] {
+  return CRITIQUE_CRITERIA.filter((c) => scores[c] < threshold);
+}
+
+export function allCriteriaPassed(
+  scores: CritiqueScores,
+  threshold: number = PASS_SCORE_THRESHOLD,
+): boolean {
+  return CRITIQUE_CRITERIA.every((c) => scores[c] >= threshold);
+}
+
+export function draftSimilarity(a: string, b: string): number {
+  const tokensA = new Set(
+    a.toLowerCase().split(/\s+/).filter((t) => t.length > 0),
+  );
+  const tokensB = new Set(
+    b.toLowerCase().split(/\s+/).filter((t) => t.length > 0),
+  );
+  if (tokensA.size === 0 && tokensB.size === 0) return 1;
+  let intersection = 0;
+  for (const t of tokensA) if (tokensB.has(t)) intersection += 1;
+  const union = tokensA.size + tokensB.size - intersection;
+  return union === 0 ? 1 : intersection / union;
+}
+
+function formatCriterion(c: CritiqueCriterion): string {
+  return c.replace(/_/g, ' ');
+}
+
+function buildCritiqueUserPrompt(
+  topic: string,
+  summary: string,
+  draft: string,
+  sources: SearchResult[],
+  files: ResearchFile[],
+): string {
+  const sourceBlock = sources
+    .map((s, i) => `[${i + 1}] ${s.title} — ${s.url}`)
+    .join('\n');
+  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}${buildFileSummaryBlock(files)}\n\nDRAFT TO CRITIQUE:\n${draft}\n\nScore the draft now.`;
+}
+
+function buildReviseUserPrompt(
+  topic: string,
+  summary: string,
+  previousDraft: string,
+  critique: string,
+  scores: CritiqueScores,
+  sources: SearchResult[],
+  files: ResearchFile[],
+  fullTextFiles: ResearchFile[],
+): string {
+  const sourceBlock = sources
+    .map(
+      (s, i) =>
+        `[${i + 1}] ${s.title}\n    URL: ${s.url}\n    SNIPPET: ${s.snippet}`,
+    )
+    .join('\n\n');
+  const scoresBlock = CRITIQUE_CRITERIA.map(
+    (c) => `${c}: ${scores[c]}`,
+  ).join('\n');
+  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}${buildFileSummaryBlock(files)}${buildFullFileBlock(fullTextFiles)}\n\nPREVIOUS DRAFT:\n${previousDraft}\n\nEDITOR SCORES (1-5):\n${scoresBlock}\n\nEDITOR CRITIQUE:\n${critique}\n\nRewrite the draft now, addressing every issue raised.`;
 }
 
 export type RunResearchOutcome =
@@ -399,6 +569,10 @@ export type RunResearchOutcome =
       conversation: Awaited<ReturnType<typeof prisma.conversation.update>>;
       sources: SearchResult[];
       queries: string[];
+      iterations: CritiqueIterationRecord[];
+      finalScores: CritiqueScores | null;
+      exitReason: ResearchExitReason;
+      llmCallsUsed: number;
     }
   | { kind: 'not-found' }
   | { kind: 'wrong-status' }
@@ -509,6 +683,11 @@ export async function runResearchPipeline(
     extractedText: f.extractedText,
   }));
 
+  const maxIterations = getMaxResearchIterations();
+  const maxLlmCalls = getMaxLlmCallsPerResearch();
+  let llmCallsUsed = 0;
+  const llmCallsRemaining = () => maxLlmCalls - llmCallsUsed;
+
   onProgress?.({ stage: 'generating_queries', detail: 'Planning searches' });
 
   const planningMessages: LLMMessage[] = [
@@ -525,6 +704,7 @@ export async function runResearchPipeline(
 
   let queriesText: string;
   try {
+    llmCallsUsed += 1;
     queriesText = await generateAssistantText(planningMessages, modelId);
   } catch (err) {
     console.error('Search-query planning failed:', err);
@@ -597,9 +777,10 @@ export async function runResearchPipeline(
 
   onProgress?.({ stage: 'writing_draft', detail: 'Writing first draft' });
 
-  let draftText: string;
+  let currentDraft: string;
   try {
-    draftText = await generateAssistantText(
+    llmCallsUsed += 1;
+    currentDraft = await generateAssistantText(
       [
         { role: 'system', content: DRAFT_SYSTEM_PROMPT },
         {
@@ -628,17 +809,157 @@ export async function runResearchPipeline(
     fullTextIncluded: requestedFiles.some((r) => r.id === f.id),
   }));
 
+  const iterations: CritiqueIterationRecord[] = [];
+  let finalScores: CritiqueScores | null = null;
+  let exitReason: ResearchExitReason = 'iterations_exhausted';
+
+  for (let i = 1; i <= maxIterations; i += 1) {
+    if (abortSignal?.aborted) return { kind: 'aborted' };
+
+    if (llmCallsRemaining() < 1) {
+      exitReason = 'budget_exhausted';
+      break;
+    }
+
+    onProgress?.({
+      stage: 'critiquing',
+      detail: `Critique round ${i} of ${maxIterations} — scoring the draft`,
+      iteration: i,
+      maxIterations,
+    });
+
+    let critiqueText: string;
+    try {
+      llmCallsUsed += 1;
+      critiqueText = await generateAssistantText(
+        [
+          { role: 'system', content: CRITIQUE_SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: buildCritiqueUserPrompt(
+              topic,
+              summary,
+              currentDraft,
+              sources,
+              researchFiles,
+            ),
+          },
+        ],
+        modelId,
+      );
+    } catch (err) {
+      console.error(`Critique generation failed at iteration ${i}:`, err);
+      await markFailed(conversationId);
+      return { kind: 'ai-error', message: 'Could not critique the draft.' };
+    }
+
+    const parsed = parseCritique(critiqueText);
+    if (!parsed) {
+      console.error(`Critique parse failed at iteration ${i}: ${critiqueText}`);
+      exitReason = 'critique_parse_failed';
+      break;
+    }
+
+    const weakest = weakestCriteria(parsed.scores);
+    const record: CritiqueIterationRecord = {
+      iteration: i,
+      scores: parsed.scores,
+      critique: parsed.critique,
+      weakest,
+      revised: false,
+    };
+    iterations.push(record);
+    finalScores = parsed.scores;
+
+    if (allCriteriaPassed(parsed.scores)) {
+      exitReason = 'all_passed';
+      break;
+    }
+
+    if (i >= maxIterations) {
+      exitReason = 'iterations_exhausted';
+      break;
+    }
+
+    if (llmCallsRemaining() < 1) {
+      exitReason = 'budget_exhausted';
+      break;
+    }
+
+    if (abortSignal?.aborted) return { kind: 'aborted' };
+
+    onProgress?.({
+      stage: 'revising',
+      detail: `Revision ${i} of ${maxIterations - 1} — improving ${weakest
+        .map(formatCriterion)
+        .join(', ')}`,
+      iteration: i,
+      maxIterations,
+      weakestCriteria: weakest,
+      scores: parsed.scores,
+    });
+
+    let revisedDraft: string;
+    try {
+      llmCallsUsed += 1;
+      revisedDraft = await generateAssistantText(
+        [
+          { role: 'system', content: REVISE_SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: buildReviseUserPrompt(
+              topic,
+              summary,
+              currentDraft,
+              parsed.critique,
+              parsed.scores,
+              sources,
+              researchFiles,
+              requestedFiles,
+            ),
+          },
+        ],
+        modelId,
+      );
+    } catch (err) {
+      console.error(`Revision generation failed at iteration ${i}:`, err);
+      await markFailed(conversationId);
+      return { kind: 'ai-error', message: 'Could not revise the draft.' };
+    }
+
+    record.revised = true;
+    const similarity = draftSimilarity(currentDraft, revisedDraft);
+    currentDraft = revisedDraft;
+    if (similarity >= CONVERGENCE_SIMILARITY_THRESHOLD) {
+      exitReason = 'converged';
+      break;
+    }
+  }
+
+  const finalMetadata: Record<string, unknown> = {
+    kind: 'research_final',
+    queries,
+    sources,
+    documents: documentsUsed,
+    iterations: iterations.map((it) => ({
+      iteration: it.iteration,
+      scores: it.scores,
+      critique: it.critique,
+      weakest: it.weakest,
+      revised: it.revised,
+    })),
+    finalScores,
+    iterationCount: iterations.length,
+    exitReason,
+    llmCallsUsed,
+  };
+
   const assistantMessage = await prisma.message.create({
     data: {
       conversationId,
       role: 'assistant',
-      content: draftText,
-      metadata: {
-        kind: 'research_draft',
-        queries,
-        sources,
-        documents: documentsUsed,
-      },
+      content: currentDraft,
+      metadata: finalMetadata as Prisma.InputJsonValue,
     },
   });
 
@@ -653,5 +974,9 @@ export async function runResearchPipeline(
     conversation: updatedConversation,
     sources,
     queries,
+    iterations,
+    finalScores,
+    exitReason,
+    llmCallsUsed,
   };
 }

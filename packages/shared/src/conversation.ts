@@ -26,6 +26,30 @@ export interface ResearchDocumentUsage {
   fullTextIncluded: boolean;
 }
 
+export type CritiqueCriterion =
+  | 'factual_accuracy'
+  | 'completeness'
+  | 'source_coverage'
+  | 'coherence'
+  | 'scope_alignment';
+
+export type CritiqueScores = Record<CritiqueCriterion, number>;
+
+export interface CritiqueIterationRecord {
+  iteration: number;
+  scores: CritiqueScores;
+  critique: string;
+  weakest: CritiqueCriterion[];
+  revised: boolean;
+}
+
+export type ResearchExitReason =
+  | 'all_passed'
+  | 'converged'
+  | 'iterations_exhausted'
+  | 'budget_exhausted'
+  | 'critique_parse_failed';
+
 export type MessageMetadata =
   | { kind: 'clarifying_questions'; questions: string[] }
   | { kind: 'research_ready'; summary?: string }
@@ -35,19 +59,36 @@ export type MessageMetadata =
       sources: ResearchSource[];
       documents?: ResearchDocumentUsage[];
     }
+  | {
+      kind: 'research_final';
+      queries: string[];
+      sources: ResearchSource[];
+      documents?: ResearchDocumentUsage[];
+      iterations: CritiqueIterationRecord[];
+      finalScores: CritiqueScores | null;
+      iterationCount: number;
+      exitReason: ResearchExitReason;
+      llmCallsUsed: number;
+    }
   | { kind: string; [key: string]: unknown };
 
 export type ResearchProgressStage =
   | 'generating_queries'
   | 'searching'
   | 'analyzing_sources'
-  | 'writing_draft';
+  | 'writing_draft'
+  | 'critiquing'
+  | 'revising';
 
 export interface ResearchProgressEvent {
   stage: ResearchProgressStage;
   detail?: string;
   query?: string;
   sourcesFound?: number;
+  iteration?: number;
+  maxIterations?: number;
+  weakestCriteria?: CritiqueCriterion[];
+  scores?: CritiqueScores;
 }
 
 export interface ResearchCompleteEvent {

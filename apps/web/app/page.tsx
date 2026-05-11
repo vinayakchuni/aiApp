@@ -38,6 +38,10 @@ function stageLabel(stage: ResearchProgressEvent['stage']): string {
       return 'Analyzing sources...';
     case 'writing_draft':
       return 'Writing first draft...';
+    case 'critiquing':
+      return 'Critiquing the draft...';
+    case 'revising':
+      return 'Revising the draft...';
   }
 }
 
