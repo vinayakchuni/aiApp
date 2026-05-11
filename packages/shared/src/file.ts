@@ -4,6 +4,7 @@ export interface ConversationFile {
   originalName: string;
   mimeType: string;
   size: number;
+  summary: string | null;
   createdAt: string;
 }
 

@@ -20,6 +20,7 @@ import {
   removeFile,
   listFilesForConversation,
   getMaxFileSizeBytes,
+  kickoffFileSummarization,
 } from '../services/files';
 import {
   startResearch,
@@ -189,6 +190,7 @@ function publicFile(file: {
   originalName: string;
   mimeType: string;
   size: number;
+  summary?: string | null;
   createdAt: Date;
 }) {
   return {
@@ -197,6 +199,7 @@ function publicFile(file: {
     originalName: file.originalName,
     mimeType: file.mimeType,
     size: file.size,
+    summary: file.summary ?? null,
     createdAt: file.createdAt,
   };
 }
@@ -249,6 +252,11 @@ conversationsRouter.post(
         });
         return;
       case 'ok':
+        if (outcome.isResearchConversation) {
+          void kickoffFileSummarization(req.user!.id, outcome.file.id).catch(
+            (err) => console.error('Background summarization failed:', err),
+          );
+        }
         res.status(201).json({ success: true, file: publicFile(outcome.file) });
         return;
     }

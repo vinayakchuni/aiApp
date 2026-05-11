@@ -19,10 +19,22 @@ export interface ResearchSource {
   snippet: string;
 }
 
+export interface ResearchDocumentUsage {
+  id: string;
+  originalName: string;
+  hadSummary: boolean;
+  fullTextIncluded: boolean;
+}
+
 export type MessageMetadata =
   | { kind: 'clarifying_questions'; questions: string[] }
   | { kind: 'research_ready'; summary?: string }
-  | { kind: 'research_draft'; queries: string[]; sources: ResearchSource[] }
+  | {
+      kind: 'research_draft';
+      queries: string[];
+      sources: ResearchSource[];
+      documents?: ResearchDocumentUsage[];
+    }
   | { kind: string; [key: string]: unknown };
 
 export type ResearchProgressStage =

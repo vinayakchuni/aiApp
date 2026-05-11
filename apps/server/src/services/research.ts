@@ -280,9 +280,13 @@ export async function processClarifyingAnswer(
 
 // ------- Phase 2: research pipeline -------
 
-const SEARCH_QUERY_GEN_PROMPT = `You are a research planning assistant. The user has provided a topic and answered clarifying questions. Generate 3 to ${MAX_SEARCH_QUERIES} distinct, high-signal web search queries that, when combined, will surface the most relevant sources for the agreed research scope. Respond with one query per line. No numbering, no quotes, no preamble.`;
+const SEARCH_QUERY_GEN_PROMPT = `You are a research planning assistant. The user has provided a topic and answered clarifying questions. Generate 3 to ${MAX_SEARCH_QUERIES} distinct, high-signal web search queries that, when combined, will surface the most relevant sources for the agreed research scope.
 
-const DRAFT_SYSTEM_PROMPT = `You are a research analyst writing a balanced, evidence-based first draft. Use ONLY the supplied sources. Cite sources inline using bracketed numbers like [1], [2] that correspond to the numbered source list. Aim for 500-800 words. Structure the draft with: a one-paragraph introduction, 3-5 key findings as a bulleted or numbered list with citations, and a brief conclusion. Do not invent facts; if the sources are silent on a sub-question, say so.`;
+If document summaries are supplied, you may ALSO request the full text of any document that looks essential by emitting "READ_FILE: <filename>" on its own line. Only request files whose summary suggests they're directly relevant; otherwise rely on the summary.
+
+Respond with one search query per line. No numbering, no quotes, no preamble. Place any READ_FILE lines at the end.`;
+
+const DRAFT_SYSTEM_PROMPT = `You are a research analyst writing a balanced, evidence-based first draft. Use the supplied web sources AND any supplied document context. Cite web sources inline using bracketed numbers like [1], [2] that correspond to the numbered source list. When you reference an uploaded document, name it explicitly (e.g., "according to the uploaded document foo.pdf"). Aim for 500-800 words. Structure the draft with: a one-paragraph introduction, 3-5 key findings as a bulleted or numbered list with citations, and a brief conclusion. Do not invent facts; if the supplied material is silent on a sub-question, say so.`;
 
 export function parseSearchQueries(text: string): string[] {
   const lines = text
@@ -292,6 +296,7 @@ export function parseSearchQueries(text: string): string[] {
   const numbered = /^\s*(?:\d+[.)]|[-*•])\s*(.+)$/;
   const queries: string[] = [];
   for (const line of lines) {
+    if (/^READ_FILE\s*:/i.test(line)) continue;
     const match = line.match(numbered);
     const value = (match ? match[1] : line).trim();
     const stripped = value.replace(/^["'`]+|["'`]+$/g, '').trim();
@@ -300,10 +305,48 @@ export function parseSearchQueries(text: string): string[] {
   return queries.slice(0, MAX_SEARCH_QUERIES);
 }
 
+export function parseRequestedFiles(text: string): string[] {
+  const out: string[] = [];
+  const re = /^READ_FILE\s*:\s*(.+)$/gim;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const name = match[1].trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    if (name.length > 0) out.push(name);
+  }
+  return out;
+}
+
+interface ResearchFile {
+  id: string;
+  originalName: string;
+  summary: string | null;
+  extractedText: string;
+}
+
+function buildFileSummaryBlock(files: ResearchFile[]): string {
+  if (files.length === 0) return '';
+  const entries = files.map((f) => {
+    const body = f.summary && f.summary.length > 0 ? f.summary : '(summary pending)';
+    return `- ${f.originalName}: ${body}`;
+  });
+  return `\n\nUPLOADED DOCUMENT SUMMARIES:\n${entries.join('\n')}`;
+}
+
+function buildFullFileBlock(files: ResearchFile[]): string {
+  if (files.length === 0) return '';
+  const entries = files.map(
+    (f) =>
+      `[Uploaded file: ${f.originalName}]\n${f.extractedText}\n[End of file: ${f.originalName}]`,
+  );
+  return `\n\nFULL UPLOADED DOCUMENTS:\n${entries.join('\n\n')}`;
+}
+
 function buildDraftUserPrompt(
   topic: string,
   summary: string,
   sources: SearchResult[],
+  files: ResearchFile[],
+  fullTextFiles: ResearchFile[],
 ): string {
   const sourceBlock = sources
     .map(
@@ -311,7 +354,29 @@ function buildDraftUserPrompt(
         `[${i + 1}] ${s.title}\n    URL: ${s.url}\n    SNIPPET: ${s.snippet}`,
     )
     .join('\n\n');
-  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}\n\nWrite the first draft now.`;
+  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}${buildFileSummaryBlock(files)}${buildFullFileBlock(fullTextFiles)}\n\nWrite the first draft now.`;
+}
+
+export function matchRequestedFiles(
+  requested: string[],
+  files: ResearchFile[],
+): ResearchFile[] {
+  const matched: ResearchFile[] = [];
+  const seen = new Set<string>();
+  for (const name of requested) {
+    const needle = name.toLowerCase();
+    const hit = files.find(
+      (f) =>
+        !seen.has(f.id) &&
+        (f.originalName.toLowerCase() === needle ||
+          f.originalName.toLowerCase().includes(needle)),
+    );
+    if (hit) {
+      matched.push(hit);
+      seen.add(hit.id);
+    }
+  }
+  return matched;
 }
 
 export type ResearchProgressStage =
@@ -432,6 +497,18 @@ export async function runResearchPipeline(
     clarifyingAnswers.push(m.content);
   }
 
+  const fileRows = await prisma.file.findMany({
+    where: { conversationId },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true, originalName: true, summary: true, extractedText: true },
+  });
+  const researchFiles: ResearchFile[] = fileRows.map((f) => ({
+    id: f.id,
+    originalName: f.originalName,
+    summary: f.summary,
+    extractedText: f.extractedText,
+  }));
+
   onProgress?.({ stage: 'generating_queries', detail: 'Planning searches' });
 
   const planningMessages: LLMMessage[] = [
@@ -442,7 +519,7 @@ export async function runResearchPipeline(
         clarifyingAnswers.length > 0
           ? clarifyingAnswers.map((a) => `- ${a}`).join('\n')
           : '(none provided)'
-      }`,
+      }${buildFileSummaryBlock(researchFiles)}`,
     },
   ];
 
@@ -458,6 +535,10 @@ export async function runResearchPipeline(
   if (abortSignal?.aborted) return { kind: 'aborted' };
 
   const queries = parseSearchQueries(queriesText);
+  const requestedFiles = matchRequestedFiles(
+    parseRequestedFiles(queriesText),
+    researchFiles,
+  );
   if (queries.length === 0) {
     await markFailed(conversationId);
     return { kind: 'ai-error', message: 'Could not plan searches.' };
@@ -521,7 +602,16 @@ export async function runResearchPipeline(
     draftText = await generateAssistantText(
       [
         { role: 'system', content: DRAFT_SYSTEM_PROMPT },
-        { role: 'user', content: buildDraftUserPrompt(topic, summary, sources) },
+        {
+          role: 'user',
+          content: buildDraftUserPrompt(
+            topic,
+            summary,
+            sources,
+            researchFiles,
+            requestedFiles,
+          ),
+        },
       ],
       modelId,
     );
@@ -530,6 +620,13 @@ export async function runResearchPipeline(
     await markFailed(conversationId);
     return { kind: 'ai-error', message: 'Could not write the draft.' };
   }
+
+  const documentsUsed = researchFiles.map((f) => ({
+    id: f.id,
+    originalName: f.originalName,
+    hadSummary: !!f.summary,
+    fullTextIncluded: requestedFiles.some((r) => r.id === f.id),
+  }));
 
   const assistantMessage = await prisma.message.create({
     data: {
@@ -540,6 +637,7 @@ export async function runResearchPipeline(
         kind: 'research_draft',
         queries,
         sources,
+        documents: documentsUsed,
       },
     },
   });

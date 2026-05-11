@@ -3,6 +3,7 @@ import { promises as fs } from 'fs';
 import crypto from 'crypto';
 import { prisma } from '../lib/db';
 import { detectExtension, extractText, SUPPORTED_EXTENSIONS } from './extract';
+import { summarizeFile } from './summarize';
 
 const DEFAULT_UPLOAD_DIR = path.join(process.cwd(), 'uploads');
 const DEFAULT_MAX_FILES = 2;
@@ -31,7 +32,11 @@ export function getSupportedExtensions(): readonly string[] {
 }
 
 export type UploadOutcome =
-  | { kind: 'ok'; file: Awaited<ReturnType<typeof prisma.file.create>> }
+  | {
+      kind: 'ok';
+      file: Awaited<ReturnType<typeof prisma.file.create>>;
+      isResearchConversation: boolean;
+    }
   | { kind: 'not-found' }
   | { kind: 'unsupported-type' }
   | { kind: 'too-large' }
@@ -50,7 +55,7 @@ export interface UploadInput {
 export async function ingestUploadedFile(input: UploadInput): Promise<UploadOutcome> {
   const conversation = await prisma.conversation.findUnique({
     where: { id: input.conversationId },
-    select: { id: true, userId: true },
+    select: { id: true, userId: true, mode: true },
   });
   if (!conversation || conversation.userId !== input.userId) {
     return { kind: 'not-found' };
@@ -97,7 +102,22 @@ export async function ingestUploadedFile(input: UploadInput): Promise<UploadOutc
     },
   });
 
-  return { kind: 'ok', file };
+  return {
+    kind: 'ok',
+    file,
+    isResearchConversation: conversation.mode === 'research',
+  };
+}
+
+export async function kickoffFileSummarization(
+  userId: string,
+  fileId: string,
+): Promise<void> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { preferredModel: true },
+  });
+  await summarizeFile(fileId, { preferredModel: user?.preferredModel });
 }
 
 export type DeleteOutcome = 'ok' | 'not-found';

@@ -140,6 +140,7 @@ export async function getConversationForUser(userId: string, conversationId: str
           originalName: true,
           mimeType: true,
           size: true,
+          summary: true,
           createdAt: true,
         },
       },

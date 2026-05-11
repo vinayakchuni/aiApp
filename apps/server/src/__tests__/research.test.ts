@@ -63,6 +63,8 @@ import {
   parseClarifyingQuestions,
   parseProcessAnswerResponse,
   parseSearchQueries,
+  parseRequestedFiles,
+  matchRequestedFiles,
   runResearchPipeline,
 } from '../services/research';
 import { createSearchService, SearchProviderError } from '../services/search';
@@ -620,6 +622,41 @@ heat stress livestock`),
     const text = Array.from({ length: 9 }, (_, i) => `q${i}`).join('\n');
     expect(parseSearchQueries(text)).toHaveLength(5);
   });
+
+  it('ignores READ_FILE lines mixed in with queries', () => {
+    expect(
+      parseSearchQueries(`eu climate policy
+READ_FILE: report.pdf
+heat stress livestock`),
+    ).toEqual(['eu climate policy', 'heat stress livestock']);
+  });
+});
+
+describe('parseRequestedFiles + matchRequestedFiles', () => {
+  it('extracts READ_FILE: <name> lines case-insensitively', () => {
+    expect(
+      parseRequestedFiles(`some queries
+READ_FILE: alpha.pdf
+read_file:beta.txt
+nope.txt`),
+    ).toEqual(['alpha.pdf', 'beta.txt']);
+  });
+
+  it('strips wrapping quotes', () => {
+    expect(parseRequestedFiles('READ_FILE: "Quoted Doc.pdf"')).toEqual([
+      'Quoted Doc.pdf',
+    ]);
+  });
+
+  it('matches files by exact name then substring, never double-counting', () => {
+    const files = [
+      { id: '1', originalName: 'report.pdf', summary: null, extractedText: 'a' },
+      { id: '2', originalName: 'notes.txt', summary: null, extractedText: 'b' },
+    ];
+    expect(matchRequestedFiles(['report.pdf', 'report.pdf'], files)).toHaveLength(1);
+    expect(matchRequestedFiles(['report'], files)[0].id).toBe('1');
+    expect(matchRequestedFiles(['missing.docx'], files)).toEqual([]);
+  });
 });
 
 describe('runResearchPipeline', () => {
@@ -627,6 +664,7 @@ describe('runResearchPipeline', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
   });
 
   function setupConversation(opts: {
@@ -827,6 +865,98 @@ describe('runResearchPipeline', () => {
     });
   });
 
+  it('injects file summaries into planning and full text into draft when LLM requests READ_FILE', async () => {
+    setupConversation();
+    setupHistory();
+    mockedPrisma.file.findMany.mockResolvedValue([
+      {
+        id: 'f-1',
+        originalName: 'climate-report.pdf',
+        summary: 'Authoritative summary of EU climate impacts.',
+        extractedText: 'FULL TEXT OF THE CLIMATE REPORT',
+      },
+      {
+        id: 'f-2',
+        originalName: 'misc.txt',
+        summary: 'Tangentially related notes.',
+        extractedText: 'FULL TEXT OF MISC',
+      },
+    ] as never);
+
+    mockedGenerate
+      .mockResolvedValueOnce(
+        'eu climate policy\nheat stress crops\nREAD_FILE: climate-report.pdf',
+      )
+      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].');
+
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-draft',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'Draft body with citations [1] [2] [3].',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'New conversation',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+
+    const out = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+    });
+    expect(out.kind).toBe('ok');
+
+    // Planning prompt contained both summaries
+    const planningCall = mockedGenerate.mock.calls[0];
+    const planningPrompt = (planningCall[0] as Array<{ content: string }>)
+      .map((m) => m.content)
+      .join('\n');
+    expect(planningPrompt).toContain('Authoritative summary of EU climate impacts.');
+    expect(planningPrompt).toContain('Tangentially related notes.');
+
+    // Draft prompt contained the requested file's full text but NOT the other file's full text
+    const draftCall = mockedGenerate.mock.calls[1];
+    const draftPrompt = (draftCall[0] as Array<{ content: string }>)
+      .map((m) => m.content)
+      .join('\n');
+    expect(draftPrompt).toContain('FULL TEXT OF THE CLIMATE REPORT');
+    expect(draftPrompt).not.toContain('FULL TEXT OF MISC');
+    // Both summaries are still passed at the summary tier
+    expect(draftPrompt).toContain('Authoritative summary of EU climate impacts.');
+    expect(draftPrompt).toContain('Tangentially related notes.');
+
+    // documents metadata reflects what was injected
+    const draftCreate = mockedPrisma.message.create.mock.calls[0][0] as {
+      data: {
+        metadata: {
+          kind: string;
+          documents: { id: string; fullTextIncluded: boolean }[];
+        };
+      };
+    };
+    expect(draftCreate.data.metadata.kind).toBe('research_draft');
+    expect(draftCreate.data.metadata.documents).toEqual([
+      { id: 'f-1', originalName: 'climate-report.pdf', hadSummary: true, fullTextIncluded: true },
+      { id: 'f-2', originalName: 'misc.txt', hadSummary: true, fullTextIncluded: false },
+    ]);
+  });
+
   it('returns ai-error when draft generation throws (after gathering sources)', async () => {
     setupConversation();
     setupHistory();
@@ -859,6 +989,7 @@ describe('POST /api/conversations/:id/research/run (SSE)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
   });
 
   it('requires auth', async () => {

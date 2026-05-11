@@ -37,8 +37,13 @@ vi.mock('../lib/db', () => ({
       create: vi.fn(),
       findUnique: vi.fn(),
       delete: vi.fn(),
+      update: vi.fn(),
     },
   },
+}));
+
+vi.mock('../services/summarize', () => ({
+  summarizeFile: vi.fn(),
 }));
 
 vi.mock('../services/extract', async () => {
@@ -53,9 +58,11 @@ vi.mock('../services/extract', async () => {
 
 import { prisma } from '../lib/db';
 import { extractText } from '../services/extract';
+import { summarizeFile } from '../services/summarize';
 
 const mockedPrisma = vi.mocked(prisma);
 const mockedExtract = vi.mocked(extractText);
+const mockedSummarize = vi.mocked(summarizeFile);
 
 const USER_ID = 'user-1';
 const OTHER_USER_ID = 'user-2';
@@ -83,6 +90,7 @@ describe('Files API', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     mockedExtract.mockImplementation(async (buffer) => `extracted:${buffer.toString('utf8')}`);
+    mockedSummarize.mockResolvedValue({ kind: 'ok', summary: 'summary' } as never);
     await fs.rm(TEST_UPLOAD_DIR, { recursive: true, force: true });
   });
 
@@ -146,6 +154,80 @@ describe('Files API', () => {
       // file is actually written to disk
       const written = await fs.readFile(createCall.data.storagePath, 'utf8');
       expect(written).toBe('hello');
+    });
+
+    it('kicks off summarization in the background for research conversations', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: CONV_ID,
+        userId: USER_ID,
+        mode: 'research',
+      } as never);
+      mockedPrisma.file.count.mockResolvedValue(0 as never);
+      mockedPrisma.user.findUnique.mockResolvedValue({
+        id: USER_ID,
+        preferredModel: 'openai:gpt-4o-mini',
+      } as never);
+      const now = new Date();
+      mockedPrisma.file.create.mockResolvedValue({
+        id: 'file-research-1',
+        conversationId: CONV_ID,
+        originalName: 'paper.pdf',
+        mimeType: 'application/pdf',
+        size: 5,
+        extractedText: 'extracted:hello',
+        storagePath: '/tmp/anything',
+        createdAt: now,
+      } as never);
+
+      const res = await request(app)
+        .post(`/api/conversations/${CONV_ID}/files`)
+        .set('Cookie', 'session_id=session-1')
+        .attach('file', Buffer.from('hello'), {
+          filename: 'paper.pdf',
+          contentType: 'application/pdf',
+        });
+
+      expect(res.status).toBe(201);
+      // Background summarization fires; allow microtasks to settle
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockedSummarize).toHaveBeenCalledTimes(1);
+      const [fileId, opts] = mockedSummarize.mock.calls[0] as [string, { preferredModel: string }];
+      expect(fileId).toBe('file-research-1');
+      expect(opts.preferredModel).toBe('openai:gpt-4o-mini');
+    });
+
+    it('does NOT kick off summarization for chat conversations', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: CONV_ID,
+        userId: USER_ID,
+        mode: 'chat',
+      } as never);
+      mockedPrisma.file.count.mockResolvedValue(0 as never);
+      const now = new Date();
+      mockedPrisma.file.create.mockResolvedValue({
+        id: 'file-chat-1',
+        conversationId: CONV_ID,
+        originalName: 'notes.txt',
+        mimeType: 'text/plain',
+        size: 5,
+        extractedText: 'extracted:hello',
+        storagePath: '/tmp/anything',
+        createdAt: now,
+      } as never);
+
+      const res = await request(app)
+        .post(`/api/conversations/${CONV_ID}/files`)
+        .set('Cookie', 'session_id=session-1')
+        .attach('file', Buffer.from('hello'), {
+          filename: 'notes.txt',
+          contentType: 'text/plain',
+        });
+
+      expect(res.status).toBe(201);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockedSummarize).not.toHaveBeenCalled();
     });
 
     it("returns 404 for another user's conversation", async () => {

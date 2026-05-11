@@ -61,6 +61,7 @@ export default function Home() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [conversationFull, setConversationFull] = useState(false);
   const [researchProgress, setResearchProgress] = useState<ResearchProgressEvent | null>(null);
+  const [expandedSummaryIds, setExpandedSummaryIds] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const researchAbortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -151,6 +152,29 @@ export default function Home() {
   useEffect(() => {
     scrollToBottom();
   }, [activeConversation?.messages.length, lastMessageContent, scrollToBottom]);
+
+  // Poll for file summaries while there are unanalyzed files in a research conversation.
+  useEffect(() => {
+    if (!activeId || !activeConversation) return;
+    if (activeConversation.mode !== 'research') return;
+    const pending = activeConversation.files.some((f) => f.summary === null);
+    if (!pending) return;
+    const handle = window.setTimeout(() => {
+      apiGet(`/api/conversations/${activeId}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.success) {
+            setActiveConversation((prev) =>
+              prev && prev.id === activeId
+                ? { ...prev, files: (data.conversation as ConversationWithMessages).files }
+                : prev,
+            );
+          }
+        })
+        .catch(console.error);
+    }, 3000);
+    return () => window.clearTimeout(handle);
+  }, [activeId, activeConversation]);
 
   function handleStopGenerating() {
     abortControllerRef.current?.abort();
@@ -1101,26 +1125,65 @@ export default function Home() {
             >
               <div className="mx-auto flex max-w-3xl flex-col gap-2">
                 {activeConversation.files.length > 0 && (
-                  <ul className="flex flex-wrap gap-2">
-                    {activeConversation.files.map((f) => (
-                      <li
-                        key={f.id}
-                        className="flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs text-gray-700"
-                      >
-                        <span className="max-w-[12rem] truncate" title={f.originalName}>
-                          {f.originalName}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => void handleRemoveFile(f)}
-                          aria-label={`Remove ${f.originalName}`}
-                          title="Remove"
-                          className="rounded-full px-1 text-gray-500 hover:bg-gray-200 hover:text-gray-900"
+                  <ul className="flex flex-col gap-2">
+                    {activeConversation.files.map((f) => {
+                      const isResearch = activeConversation.mode === 'research';
+                      const isAnalyzing = isResearch && f.summary === null;
+                      const hasSummary =
+                        isResearch && typeof f.summary === 'string' && f.summary.length > 0;
+                      const isExpanded = expandedSummaryIds.has(f.id);
+                      return (
+                        <li
+                          key={f.id}
+                          className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700"
                         >
-                          x
-                        </button>
-                      </li>
-                    ))}
+                          <div className="flex items-center gap-2">
+                            <span className="max-w-[12rem] truncate" title={f.originalName}>
+                              {f.originalName}
+                            </span>
+                            {isAnalyzing && (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-purple-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-purple-700">
+                                <span
+                                  aria-hidden
+                                  className="h-1 w-1 animate-pulse rounded-full bg-purple-500"
+                                />
+                                Analyzing document...
+                              </span>
+                            )}
+                            {hasSummary && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedSummaryIds((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(f.id)) next.delete(f.id);
+                                    else next.add(f.id);
+                                    return next;
+                                  })
+                                }
+                                className="rounded border border-purple-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-purple-700 hover:bg-purple-50"
+                              >
+                                {isExpanded ? 'Hide summary' : 'View summary'}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => void handleRemoveFile(f)}
+                              aria-label={`Remove ${f.originalName}`}
+                              title="Remove"
+                              className="ml-auto rounded-full px-1 text-gray-500 hover:bg-gray-200 hover:text-gray-900"
+                            >
+                              x
+                            </button>
+                          </div>
+                          {hasSummary && isExpanded && (
+                            <p className="mt-2 whitespace-pre-wrap rounded bg-white p-2 text-xs leading-relaxed text-gray-800">
+                              {f.summary}
+                            </p>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
                 {uploadError && (
