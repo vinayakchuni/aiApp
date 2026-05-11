@@ -2815,6 +2815,122 @@ describe('Phase 7: failure messages persisted to conversation', () => {
   });
 });
 
+describe('Phase 8: preferredModel propagation through the research pipeline', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedGenerate.mockReset();
+    _resetActiveResearch();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+  });
+
+  it('passes the user\'s preferredModel to every LLM call in the pipeline', async () => {
+    const preferred = 'ollama:llama3.1';
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: preferred, email: null },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Climate impacts on agriculture', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: focus on EU through 2030.',
+        metadata: { kind: 'research_ready', summary: 'focus on EU through 2030' },
+      },
+    ] as never);
+
+    mockedGenerate
+      .mockResolvedValueOnce('eu agriculture climate impacts\nheat stress crops eu')
+      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi
+        .fn()
+        .mockResolvedValueOnce([
+          { title: 'A', url: 'https://a.example', snippet: 'sa' },
+          { title: 'B', url: 'https://b.example', snippet: 'sb' },
+          { title: 'C', url: 'https://c.example', snippet: 'sc' },
+        ])
+        .mockResolvedValue([]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-final',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: '',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Climate',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    expect(mockedGenerate).toHaveBeenCalled();
+    for (const call of mockedGenerate.mock.calls) {
+      expect(call[1]).toBe(preferred);
+    }
+  });
+
+  it('falls back to the default model when preferredModel is null', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: null, email: null },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    mockedGenerate.mockRejectedValueOnce(new Error('stop here'));
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
+
+    await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(mockedGenerate).toHaveBeenCalled();
+    expect(mockedGenerate.mock.calls[0][1]).toBe('openai:gpt-4o-mini');
+  });
+
+  it('falls back to the default model when preferredModel is unsupported', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'made-up:not-a-real-model', email: null },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    mockedGenerate.mockRejectedValueOnce(new Error('stop here'));
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+    mockedPrisma.message.create.mockResolvedValue({} as never);
+
+    await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(mockedGenerate).toHaveBeenCalled();
+    expect(mockedGenerate.mock.calls[0][1]).toBe('openai:gpt-4o-mini');
+  });
+});
+
 function parseSseEvents(body: string) {
   const events: { event: string; data: unknown }[] = [];
   for (const block of body.split('\n\n')) {

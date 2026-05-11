@@ -388,6 +388,111 @@ function stageLabel(stage: ResearchProgressEvent['stage']): string {
   }
 }
 
+const RESEARCH_STEPS = [
+  { key: 'plan', label: 'Plan' },
+  { key: 'search', label: 'Search' },
+  { key: 'draft', label: 'Draft' },
+  { key: 'refine', label: 'Refine' },
+  { key: 'finalize', label: 'Finalize' },
+] as const;
+
+type ResearchStepKey = (typeof RESEARCH_STEPS)[number]['key'];
+
+function stageToStep(stage: ResearchProgressEvent['stage']): ResearchStepKey {
+  switch (stage) {
+    case 'generating_queries':
+      return 'plan';
+    case 'searching':
+    case 'analyzing_sources':
+      return 'search';
+    case 'writing_draft':
+      return 'draft';
+    case 'critiquing':
+    case 'fact_checking':
+    case 'revising':
+      return 'refine';
+    case 'finalizing':
+      return 'finalize';
+  }
+}
+
+function ResearchProgressBanner({ progress }: { progress: ResearchProgressEvent }) {
+  const activeStep = stageToStep(progress.stage);
+  const activeIndex = RESEARCH_STEPS.findIndex((s) => s.key === activeStep);
+  const totalSteps = RESEARCH_STEPS.length;
+  const progressPercent = Math.round(((activeIndex + 1) / totalSteps) * 100);
+  const detail = progress.detail ?? stageLabel(progress.stage);
+  const showIteration =
+    typeof progress.iteration === 'number' && typeof progress.maxIterations === 'number';
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="border-t border-purple-200 bg-purple-50 px-4 py-3 md:px-6"
+    >
+      <div className="mx-auto flex max-w-3xl flex-col gap-2 text-purple-900">
+        <div className="flex items-center gap-3 text-sm">
+          <span
+            aria-label="Research in progress"
+            className="inline-flex flex-shrink-0 gap-1"
+          >
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-500 [animation-delay:-0.3s]" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-500 [animation-delay:-0.15s]" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-500" />
+          </span>
+          <span className="flex-1 truncate font-medium">{detail}</span>
+          {showIteration && (
+            <span className="flex-shrink-0 rounded-full bg-purple-200 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-purple-800">
+              Round {progress.iteration} / {progress.maxIterations}
+            </span>
+          )}
+        </div>
+        <div
+          className="h-1 w-full overflow-hidden rounded-full bg-purple-200"
+          role="progressbar"
+          aria-valuenow={progressPercent}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div
+            className="h-full rounded-full bg-purple-600 transition-all duration-500 ease-out"
+            style={{ width: `${progressPercent}%` }}
+          />
+        </div>
+        <ol className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide">
+          {RESEARCH_STEPS.map((step, i) => {
+            const done = i < activeIndex;
+            const active = i === activeIndex;
+            return (
+              <li
+                key={step.key}
+                className={`flex flex-1 items-center gap-1 ${
+                  active ? 'text-purple-800' : done ? 'text-purple-600' : 'text-purple-300'
+                }`}
+                aria-current={active ? 'step' : undefined}
+              >
+                <span
+                  className={`inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full text-[9px] ${
+                    active
+                      ? 'bg-purple-600 text-white shadow-sm ring-2 ring-purple-200'
+                      : done
+                        ? 'bg-purple-500 text-white'
+                        : 'bg-purple-200 text-purple-500'
+                  }`}
+                >
+                  {done ? '✓' : i + 1}
+                </span>
+                <span className="truncate">{step.label}</span>
+              </li>
+            );
+          })}
+        </ol>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [user, setUser] = useState<UserResponse | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -466,9 +571,22 @@ export default function Home() {
       .then((res) => res.json())
       .then((data) => {
         if (data.success) {
-          setConversations(data.conversations as Conversation[]);
-          if (data.conversations.length > 0) {
-            setActiveId((current) => current ?? data.conversations[0].id);
+          const list = data.conversations as Conversation[];
+          setConversations(list);
+          if (list.length > 0) {
+            let target: string | null = null;
+            if (typeof window !== 'undefined') {
+              const params = new URLSearchParams(window.location.search);
+              const fromQuery = params.get('conversation');
+              if (fromQuery && list.some((c) => c.id === fromQuery)) {
+                target = fromQuery;
+                params.delete('conversation');
+                const next = params.toString();
+                const url = next ? `${window.location.pathname}?${next}` : window.location.pathname;
+                window.history.replaceState(null, '', url);
+              }
+            }
+            setActiveId((current) => current ?? target ?? list[0].id);
           }
         }
       })
@@ -1356,10 +1474,11 @@ export default function Home() {
                     onClick={() => void toggleResearchMode()}
                     title={
                       activeConversation.mode === 'research'
-                        ? 'Switch to regular chat'
-                        : 'Switch to research mode'
+                        ? 'Switch off research — turn this into a regular chat.'
+                        : 'Switch on research — the agent will ask clarifying questions, search the web, and write a cited report.'
                     }
-                    className={`rounded-md border px-2 py-1 text-xs font-medium ${
+                    aria-pressed={activeConversation.mode === 'research'}
+                    className={`rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
                       activeConversation.mode === 'research'
                         ? 'border-purple-300 bg-purple-50 text-purple-700 hover:bg-purple-100'
                         : 'border-gray-200 bg-white text-gray-700 hover:bg-gray-50'
@@ -1390,10 +1509,20 @@ export default function Home() {
                 {activeConversation.messages.length === 0 ? (
                   <li className="py-8 text-center text-sm text-gray-500">
                     {activeConversation.mode === 'research' ? (
-                      <>
-                        Research mode is on. Enter a topic to begin — the agent will ask
-                        clarifying questions before kicking off research.
-                      </>
+                      <div className="mx-auto max-w-md rounded-lg border border-purple-200 bg-purple-50/40 p-5 text-left">
+                        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+                          Research mode
+                        </div>
+                        <p className="mb-3 text-sm text-gray-800">
+                          Enter a research topic below. The agent will ask a few clarifying
+                          questions, then search the web and write a cited report.
+                        </p>
+                        <ul className="space-y-1 text-xs text-gray-600">
+                          <li>• Attach PDFs or docs to ground the research</li>
+                          <li>• A copy of the final report is emailed when complete</li>
+                          <li>• Up to 5 revision rounds for quality</li>
+                        </ul>
+                      </div>
                     ) : (
                       <>Send a message to start the conversation.</>
                     )}
@@ -1471,23 +1600,7 @@ export default function Home() {
             )}
 
             {/* Research progress banner */}
-            {researchProgress && (
-              <div className="border-t border-purple-200 bg-purple-50 px-4 py-3 md:px-6">
-                <div className="mx-auto flex max-w-3xl items-center gap-3 text-sm text-purple-800">
-                  <span
-                    aria-label="Research in progress"
-                    className="inline-flex gap-1"
-                  >
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-400 [animation-delay:-0.3s]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-400 [animation-delay:-0.15s]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-400" />
-                  </span>
-                  <span className="flex-1">
-                    {researchProgress.detail ?? stageLabel(researchProgress.stage)}
-                  </span>
-                </div>
-              </div>
-            )}
+            {researchProgress && <ResearchProgressBanner progress={researchProgress} />}
 
             {/* Conversation full banner */}
             {conversationFull && (
