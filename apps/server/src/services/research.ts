@@ -1,6 +1,6 @@
 import { prisma } from '../lib/db';
 import { Prisma } from '../generated/prisma/client';
-import { generateAssistantText } from './ai';
+import { generateAssistantText, type TracingContext } from './ai';
 import { sendResearchCompleteEmail } from './email';
 import { DEFAULT_MODEL_ID, isSupportedModel } from './models';
 import type { LLMMessage } from './context';
@@ -616,6 +616,8 @@ export interface FactCheckOptions {
   modelId: string;
   generateFn?: typeof generateAssistantText;
   abortSignal?: AbortSignal;
+  traceParent?: TracingContext;
+  iteration?: number;
 }
 
 export interface FactCheckRun {
@@ -631,6 +633,8 @@ export async function factCheckDraft(opts: FactCheckOptions): Promise<FactCheckR
     modelId,
     generateFn = generateAssistantText,
     abortSignal,
+    traceParent,
+    iteration,
   } = opts;
 
   if (search.remaining() <= 0) {
@@ -647,7 +651,11 @@ export async function factCheckDraft(opts: FactCheckOptions): Promise<FactCheckR
 
   let claimsText: string;
   try {
-    claimsText = await generateFn(buildClaimExtractPrompt(draft, maxClaims), modelId);
+    claimsText = await generateFn(buildClaimExtractPrompt(draft, maxClaims), modelId, {
+      trace: traceParent,
+      generationName: 'claim-extract',
+      generationMetadata: iteration !== undefined ? { iteration } : undefined,
+    });
   } catch (err) {
     console.error('Claim extraction failed:', err);
     return {
@@ -882,6 +890,7 @@ export interface BuildStructuredReportOptions {
   modelId: string;
   generateFn?: typeof generateAssistantText;
   abortSignal?: AbortSignal;
+  traceParent?: TracingContext;
 }
 
 export interface BuildStructuredReportRun {
@@ -903,6 +912,7 @@ export async function buildStructuredReport(
     finalScores,
     modelId,
     generateFn = generateAssistantText,
+    traceParent,
   } = opts;
 
   let text: string;
@@ -916,6 +926,7 @@ export async function buildStructuredReport(
         },
       ],
       modelId,
+      { trace: traceParent, generationName: 'report-generate' },
     );
   } catch (err) {
     console.error('Report generation failed:', err);
@@ -1234,7 +1245,10 @@ async function runResearchPipelineImpl(
   let queriesText: string;
   try {
     llmCallsUsed += 1;
-    queriesText = await generateAssistantText(planningMessages, modelId);
+    queriesText = await generateAssistantText(planningMessages, modelId, {
+      trace: searchSpan,
+      generationName: 'plan-search-queries',
+    });
   } catch (err) {
     console.error('Search-query planning failed:', err);
     searchSpan.end({
@@ -1389,6 +1403,7 @@ async function runResearchPipelineImpl(
         },
       ],
       modelId,
+      { trace: draftingSpan, generationName: 'draft-generate' },
     );
   } catch (err) {
     console.error('Draft generation failed:', err);
@@ -1458,6 +1473,11 @@ async function runResearchPipelineImpl(
           },
         ],
         modelId,
+        {
+          trace: critiqueSpan,
+          generationName: 'critique-generate',
+          generationMetadata: { iteration: i },
+        },
       );
     } catch (err) {
       console.error(`Critique generation failed at iteration ${i}:`, err);
@@ -1538,6 +1558,8 @@ async function runResearchPipelineImpl(
         search,
         modelId,
         abortSignal,
+        traceParent: factCheckSpan,
+        iteration: i,
       });
       llmCallsUsed += fc.llmCallsAttempted;
       if (fc.llmCallsAttempted > 0) {
@@ -1615,6 +1637,11 @@ async function runResearchPipelineImpl(
           },
         ],
         modelId,
+        {
+          trace: reviseSpan,
+          generationName: 'revise-generate',
+          generationMetadata: { iteration: i },
+        },
       );
     } catch (err) {
       console.error(`Revision generation failed at iteration ${i}:`, err);
@@ -1660,6 +1687,7 @@ async function runResearchPipelineImpl(
       finalScores,
       modelId,
       abortSignal,
+      traceParent: finalizingSpan,
     });
     llmCallsUsed += reportRun.llmCallsAttempted;
     structuredReport = reportRun.report;

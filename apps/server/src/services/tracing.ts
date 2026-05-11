@@ -1,4 +1,9 @@
-import { Langfuse, type LangfuseSpanClient, type LangfuseTraceClient } from 'langfuse';
+import {
+  Langfuse,
+  type LangfuseSpanClient,
+  type LangfuseTraceClient,
+} from 'langfuse';
+import { calculateCost, type CostBreakdown } from './cost';
 
 const DEFAULT_BASE_URL = 'https://cloud.langfuse.com';
 
@@ -46,9 +51,34 @@ export interface PhaseSpanUpdate {
   statusMessage?: string;
 }
 
+export interface GenerationUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+}
+
+export interface StartGenerationOptions {
+  modelId: string;
+  input?: unknown;
+  metadata?: Record<string, unknown>;
+}
+
+export interface EndGenerationOptions {
+  output?: unknown;
+  usage?: GenerationUsage;
+  metadata?: Record<string, unknown>;
+  level?: 'DEFAULT' | 'WARNING' | 'ERROR';
+  statusMessage?: string;
+}
+
+export interface GenerationSpan {
+  end(opts?: EndGenerationOptions): void;
+}
+
 export interface PhaseSpan {
   update(body: PhaseSpanUpdate): void;
   end(body?: PhaseSpanUpdate): void;
+  startGeneration(name: string, opts: StartGenerationOptions): GenerationSpan;
 }
 
 export interface StartSpanOptions {
@@ -63,12 +93,24 @@ export interface FinishTraceOptions {
   error?: string;
 }
 
+export interface TraceCostTotals {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  inputCost: number;
+  outputCost: number;
+  totalCost: number;
+  generations: number;
+}
+
 export interface ResearchTrace {
   isEnabled: boolean;
   startSpan(name: string, opts?: StartSpanOptions): PhaseSpan;
+  startGeneration(name: string, opts: StartGenerationOptions): GenerationSpan;
   updateMetadata(patch: Record<string, unknown>): void;
   markError(message: string): void;
   finish(opts?: FinishTraceOptions): Promise<void>;
+  getCostTotals(): TraceCostTotals;
 }
 
 export interface ResearchTraceInit {
@@ -80,26 +122,113 @@ export interface ResearchTraceInit {
   scopeSummary?: string;
 }
 
+const noopGeneration: GenerationSpan = {
+  end() {},
+};
+
 const noopSpan: PhaseSpan = {
   update() {},
   end() {},
+  startGeneration: () => noopGeneration,
 };
+
+const zeroTotals: TraceCostTotals = Object.freeze({
+  inputTokens: 0,
+  outputTokens: 0,
+  totalTokens: 0,
+  inputCost: 0,
+  outputCost: 0,
+  totalCost: 0,
+  generations: 0,
+});
 
 const noopTrace: ResearchTrace = {
   isEnabled: false,
   startSpan: () => noopSpan,
+  startGeneration: () => noopGeneration,
   updateMetadata() {},
   markError() {},
   async finish() {},
+  getCostTotals: () => zeroTotals,
 };
 
-function wrapSpan(span: LangfuseSpanClient): PhaseSpan {
+function buildGeneration(
+  parent: LangfuseTraceClient | LangfuseSpanClient,
+  name: string,
+  opts: StartGenerationOptions,
+  onEnd: (
+    modelId: string,
+    usage: GenerationUsage | undefined,
+    cost: CostBreakdown,
+  ) => void,
+): GenerationSpan {
+  const handle = safe(
+    () =>
+      parent.generation({
+        name,
+        model: opts.modelId,
+        input: opts.input,
+        metadata: opts.metadata,
+        startTime: new Date(),
+      }),
+    null,
+    `generation(${name}) create`,
+  );
+  if (!handle) return noopGeneration;
+  return {
+    end(body) {
+      const usage = body?.usage;
+      const cost = calculateCost(opts.modelId, {
+        inputTokens: usage?.inputTokens,
+        outputTokens: usage?.outputTokens,
+      });
+      safe(
+        () =>
+          void handle.end({
+            output: body?.output,
+            level: body?.level,
+            statusMessage: body?.statusMessage,
+            metadata: body?.metadata,
+            usageDetails: usage
+              ? {
+                  input: usage.inputTokens ?? 0,
+                  output: usage.outputTokens ?? 0,
+                  total:
+                    usage.totalTokens ??
+                    (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+                }
+              : undefined,
+            costDetails: {
+              input: cost.inputCost,
+              output: cost.outputCost,
+              total: cost.totalCost,
+            },
+          }),
+        undefined,
+        `generation(${name}).end`,
+      );
+      onEnd(opts.modelId, usage, cost);
+    },
+  };
+}
+
+function wrapSpan(
+  span: LangfuseSpanClient,
+  onGenerationEnd: (
+    modelId: string,
+    usage: GenerationUsage | undefined,
+    cost: CostBreakdown,
+  ) => void,
+): PhaseSpan {
   return {
     update(body) {
       safe(() => void span.update(body), undefined, 'span.update');
     },
     end(body) {
       safe(() => void span.end(body), undefined, 'span.end');
+    },
+    startGeneration(name, opts) {
+      return buildGeneration(span, name, opts, onGenerationEnd);
     },
   };
 }
@@ -131,6 +260,33 @@ export function createResearchTrace(init: ResearchTraceInit): ResearchTrace {
   );
   if (!trace) return noopTrace;
 
+  const totals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    inputCost: 0,
+    outputCost: 0,
+    totalCost: 0,
+    generations: 0,
+  };
+
+  function recordGenerationCost(
+    _modelId: string,
+    usage: GenerationUsage | undefined,
+    cost: CostBreakdown,
+  ): void {
+    totals.generations += 1;
+    if (usage) {
+      totals.inputTokens += usage.inputTokens ?? 0;
+      totals.outputTokens += usage.outputTokens ?? 0;
+      totals.totalTokens +=
+        usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+    }
+    totals.inputCost += cost.inputCost;
+    totals.outputCost += cost.outputCost;
+    totals.totalCost += cost.totalCost;
+  }
+
   return {
     isEnabled: true,
     startSpan(name, opts) {
@@ -145,7 +301,10 @@ export function createResearchTrace(init: ResearchTraceInit): ResearchTrace {
         null,
         `span(${name}) create`,
       );
-      return span ? wrapSpan(span) : noopSpan;
+      return span ? wrapSpan(span, recordGenerationCost) : noopSpan;
+    },
+    startGeneration(name, opts) {
+      return buildGeneration(trace, name, opts, recordGenerationCost);
     },
     updateMetadata(patch) {
       safe(() => void trace.update({ metadata: patch }), undefined, 'trace.update');
@@ -161,6 +320,7 @@ export function createResearchTrace(init: ResearchTraceInit): ResearchTrace {
         'trace.markError',
       );
     },
+    getCostTotals: () => ({ ...totals }),
     async finish(opts) {
       const patch: Parameters<LangfuseTraceClient['update']>[0] = {};
       if (opts?.output !== undefined) patch.output = opts.output;
@@ -169,6 +329,13 @@ export function createResearchTrace(init: ResearchTraceInit): ResearchTrace {
       if (opts?.error !== undefined) {
         metadata.error = opts.error;
         metadata.status = 'ERROR';
+      }
+      if (totals.generations > 0) {
+        metadata.totalInputTokens = totals.inputTokens;
+        metadata.totalOutputTokens = totals.outputTokens;
+        metadata.totalTokens = totals.totalTokens;
+        metadata.totalCostUsd = totals.totalCost;
+        metadata.generationsCount = totals.generations;
       }
       if (Object.keys(metadata).length > 0) patch.metadata = metadata;
       if (Object.keys(patch).length > 0) {
@@ -182,3 +349,4 @@ export function createResearchTrace(init: ResearchTraceInit): ResearchTrace {
     },
   };
 }
+

@@ -65,6 +65,8 @@ function clearTraceRecorder(): void {
   traceInits.length = 0;
 }
 
+const noopGen = { end: () => {} };
+
 vi.mock('../services/tracing', () => ({
   createResearchTrace: vi.fn((init: unknown) => {
     traceInits.push(init);
@@ -80,8 +82,10 @@ vi.mock('../services/tracing', () => ({
           end: (body: unknown) => {
             record.endOpts = body;
           },
+          startGeneration: () => noopGen,
         };
       },
+      startGeneration: () => noopGen,
       updateMetadata: (patch: unknown) => {
         traceMetadataUpdates.push(patch);
       },
@@ -91,6 +95,15 @@ vi.mock('../services/tracing', () => ({
       finish: async (opts: unknown) => {
         traceFinishes.push(opts);
       },
+      getCostTotals: () => ({
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        inputCost: 0,
+        outputCost: 0,
+        totalCost: 0,
+        generations: 0,
+      }),
     };
   }),
   getLangfuseClient: vi.fn(() => null),
@@ -3164,6 +3177,52 @@ describe('runResearchPipeline tracing instrumentation', () => {
     const finish = traceFinishes[0] as { error?: string; exitReason?: string };
     expect(finish.error).toBe('insufficient sources');
     expect(finish.exitReason).toBe('insufficient_sources');
+  });
+
+  it('threads a tracing context + named generation onto every LLM call', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
+      .mockResolvedValueOnce('Revised draft with very different wording entirely.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const calls = mockedGenerate.mock.calls as Array<
+      [unknown, string, { trace?: unknown; generationName?: string; generationMetadata?: unknown }]
+    >;
+    expect(calls).toHaveLength(7);
+    const names = calls.map((c) => c[2]?.generationName);
+    expect(names).toEqual([
+      'plan-search-queries',
+      'draft-generate',
+      'critique-generate',
+      'claim-extract',
+      'revise-generate',
+      'critique-generate',
+      'report-generate',
+    ]);
+
+    // Every call carries a tracing context — proves the pipeline threads spans
+    // through ai.ts so each LLM call shows up as a Langfuse generation.
+    for (const call of calls) {
+      expect(call[2]?.trace).toBeDefined();
+      expect(typeof (call[2]?.trace as { startGeneration?: unknown }).startGeneration).toBe(
+        'function',
+      );
+    }
+
+    // Iteration-scoped generations carry the iteration index for per-iter cost
+    // filtering in the Langfuse dashboard.
+    expect(calls[2][2]?.generationMetadata).toEqual({ iteration: 1 });
+    expect(calls[3][2]?.generationMetadata).toEqual({ iteration: 1 });
+    expect(calls[4][2]?.generationMetadata).toEqual({ iteration: 1 });
+    expect(calls[5][2]?.generationMetadata).toEqual({ iteration: 2 });
   });
 });
 
