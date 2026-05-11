@@ -73,6 +73,12 @@ import {
   parseClaims,
   factCheckDraft,
   countVerifiedClaims,
+  parseStructuredReport,
+  computeReportSources,
+  computeReportMethodology,
+  programmaticReportFromDraft,
+  buildStructuredReport,
+  getLatestResearchFinal,
 } from '../services/research';
 import {
   createSearchService,
@@ -99,6 +105,17 @@ scope_alignment: 4
 
 CRITIQUE:
 Completeness is thin and source coverage is uneven.`;
+
+const MOCK_REPORT = `EXECUTIVE_SUMMARY:
+A concise overview of the findings.
+
+KEY_FINDINGS:
+- Finding one with citation [1].
+- Finding two with citation [2].
+- Finding three.
+
+DETAILED_ANALYSIS:
+A longer analysis paragraph synthesizing the supplied sources [1], [2], and [3].`;
 
 const mockedPrisma = vi.mocked(prisma);
 const mockedGenerate = vi.mocked(generateAssistantText);
@@ -748,7 +765,8 @@ describe('runResearchPipeline', () => {
     mockedGenerate
       .mockResolvedValueOnce('eu agriculture climate impacts\nheat stress crops eu')
       .mockResolvedValueOnce('Draft body with citations [1] [2] [3].')
-      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
 
     const fakeSearch = {
       remaining: vi.fn().mockReturnValue(20),
@@ -830,7 +848,7 @@ describe('runResearchPipeline', () => {
       data: { researchStatus: 'complete', updatedAt: expect.any(Date) },
     });
 
-    // Progress events covered all stages including the first critique round
+    // Progress events covered all stages including the first critique round and finalizing
     const stages = progressEvents.map((p) => p.stage);
     expect(stages).toEqual([
       'generating_queries',
@@ -839,6 +857,7 @@ describe('runResearchPipeline', () => {
       'analyzing_sources',
       'writing_draft',
       'critiquing',
+      'finalizing',
     ]);
   });
 
@@ -1382,7 +1401,8 @@ describe('runResearchPipeline critique + revision loop', () => {
     mockedGenerate
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Initial draft.')
-      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
 
@@ -1391,10 +1411,10 @@ describe('runResearchPipeline critique + revision loop', () => {
       expect(out.exitReason).toBe('all_passed');
       expect(out.iterations).toHaveLength(1);
       expect(out.iterations[0].revised).toBe(false);
-      expect(out.llmCallsUsed).toBe(3);
+      // 4 calls: planning, draft, one critique, report
+      expect(out.llmCallsUsed).toBe(4);
     }
-    // 3 calls: planning, draft, one critique
-    expect(mockedGenerate).toHaveBeenCalledTimes(3);
+    expect(mockedGenerate).toHaveBeenCalledTimes(4);
   });
 
   it('runs critique → fact-check → revise → critique and exits when scores pass', async () => {
@@ -1438,14 +1458,15 @@ describe('runResearchPipeline critique + revision loop', () => {
     setupHistory();
     setupSearch();
     setupPersistence();
-    // planning + draft + (critique fail + fact-check + revise) + (critique fail) = 6 calls; 2 iterations capped
+    // planning + draft + (critique fail + fact-check + revise) + (critique fail) + report = 7 calls
     mockedGenerate
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Draft v1.')
       .mockResolvedValueOnce(FAILING_CRITIQUE)
       .mockResolvedValueOnce('Claim A.\nClaim B.')
       .mockResolvedValueOnce('Draft v2 with very different wording entirely throughout.')
-      .mockResolvedValueOnce(FAILING_CRITIQUE);
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
 
@@ -1454,7 +1475,7 @@ describe('runResearchPipeline critique + revision loop', () => {
       expect(out.exitReason).toBe('iterations_exhausted');
       expect(out.iterations).toHaveLength(2);
     }
-    expect(mockedGenerate).toHaveBeenCalledTimes(6);
+    expect(mockedGenerate).toHaveBeenCalledTimes(7);
   });
 
   it('stops with budget_exhausted before exceeding MAX_LLM_CALLS_PER_RESEARCH', async () => {
@@ -1675,7 +1696,8 @@ describe('runResearchPipeline critique + revision loop', () => {
       .mockResolvedValueOnce('Initial draft.')
       .mockResolvedValueOnce(FAILING_CRITIQUE)
       .mockResolvedValueOnce('Revised draft directly addressing the critique.')
-      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
 
@@ -1684,8 +1706,620 @@ describe('runResearchPipeline critique + revision loop', () => {
       expect(out.iterations[0].factCheck).toBeUndefined();
       expect(out.iterations[0].revised).toBe(true);
     }
-    // 5 calls: planning, draft, critique, revise, critique. NO claim extraction.
-    expect(mockedGenerate).toHaveBeenCalledTimes(5);
+    // 6 calls: planning, draft, critique, revise, critique, report. NO claim extraction.
+    expect(mockedGenerate).toHaveBeenCalledTimes(6);
+  });
+});
+
+describe('parseStructuredReport', () => {
+  it('parses the three required sections', () => {
+    const out = parseStructuredReport(`EXECUTIVE_SUMMARY:
+A short summary.
+
+KEY_FINDINGS:
+- one
+- two
+- three
+
+DETAILED_ANALYSIS:
+A longer body of text.`);
+    expect(out).not.toBeNull();
+    expect(out!.executiveSummary).toBe('A short summary.');
+    expect(out!.keyFindings).toEqual(['one', 'two', 'three']);
+    expect(out!.detailedAnalysis).toBe('A longer body of text.');
+  });
+
+  it('returns null when a section is missing', () => {
+    expect(parseStructuredReport('only a summary')).toBeNull();
+    expect(
+      parseStructuredReport(`EXECUTIVE_SUMMARY:\nx\n\nKEY_FINDINGS:\n- y`),
+    ).toBeNull();
+  });
+
+  it('handles numbered findings and strips markers', () => {
+    const out = parseStructuredReport(`EXECUTIVE_SUMMARY:
+ok
+
+KEY_FINDINGS:
+1. alpha
+2. beta
+3. gamma
+
+DETAILED_ANALYSIS:
+body`);
+    expect(out!.keyFindings).toEqual(['alpha', 'beta', 'gamma']);
+  });
+
+  it('returns null when sections are present but empty', () => {
+    const out = parseStructuredReport(`EXECUTIVE_SUMMARY:
+
+
+KEY_FINDINGS:
+
+
+DETAILED_ANALYSIS:
+`);
+    expect(out).toBeNull();
+  });
+});
+
+describe('computeReportSources', () => {
+  it('marks sources verified when their URL appears in any verified fact-check claim', () => {
+    const sources = [
+      { title: 'A', url: 'https://a.example', snippet: '' },
+      { title: 'B', url: 'https://b.example', snippet: '' },
+      { title: 'C', url: 'https://c.example', snippet: '' },
+    ];
+    const iterations = [
+      {
+        iteration: 1,
+        scores: {
+          factual_accuracy: 4,
+          completeness: 4,
+          source_coverage: 4,
+          coherence: 4,
+          scope_alignment: 4,
+        },
+        critique: 'ok',
+        weakest: [],
+        revised: false,
+        factCheck: {
+          results: [
+            {
+              claim: 'c1',
+              status: 'verified' as const,
+              supportingUrls: ['https://a.example', 'https://c.example'],
+            },
+            { claim: 'c2', status: 'unverified' as const, supportingUrls: [] },
+          ],
+          claimsExtracted: 2,
+          searchesUsed: 2,
+          budgetExhausted: false,
+        },
+      },
+    ];
+    const reliability = computeReportSources(sources, iterations).map((s) => ({
+      url: s.url,
+      r: s.reliability,
+    }));
+    expect(reliability).toEqual([
+      { url: 'https://a.example', r: 'verified' },
+      { url: 'https://b.example', r: 'unknown' },
+      { url: 'https://c.example', r: 'verified' },
+    ]);
+  });
+
+  it('marks all sources unknown when there is no fact-check', () => {
+    const sources = [{ title: 'A', url: 'https://a.example', snippet: '' }];
+    const reliability = computeReportSources(sources, []).map((s) => s.reliability);
+    expect(reliability).toEqual(['unknown']);
+  });
+});
+
+describe('computeReportMethodology', () => {
+  it('aggregates fact-check results across iterations', () => {
+    const m = computeReportMethodology(
+      ['q1', 'q2'],
+      [
+        {
+          iteration: 1,
+          scores: {
+            factual_accuracy: 3,
+            completeness: 3,
+            source_coverage: 3,
+            coherence: 3,
+            scope_alignment: 3,
+          },
+          critique: 'c',
+          weakest: ['factual_accuracy'],
+          revised: true,
+          factCheck: {
+            results: [
+              { claim: '1', status: 'verified' as const, supportingUrls: [] },
+              { claim: '2', status: 'unverified' as const, supportingUrls: [] },
+              { claim: '3', status: 'not_checked' as const, supportingUrls: [] },
+            ],
+            claimsExtracted: 3,
+            searchesUsed: 2,
+            budgetExhausted: true,
+          },
+        },
+        {
+          iteration: 2,
+          scores: {
+            factual_accuracy: 4,
+            completeness: 4,
+            source_coverage: 4,
+            coherence: 4,
+            scope_alignment: 4,
+          },
+          critique: 'c2',
+          weakest: [],
+          revised: false,
+        },
+      ],
+      {
+        factual_accuracy: 4,
+        completeness: 4,
+        source_coverage: 4,
+        coherence: 4,
+        scope_alignment: 4,
+      },
+    );
+    expect(m.queries).toEqual(['q1', 'q2']);
+    expect(m.iterationCount).toBe(2);
+    expect(m.factCheckSummary).toEqual({
+      totalClaimsExtracted: 3,
+      verifiedClaims: 1,
+      unverifiedClaims: 1,
+      notCheckedClaims: 1,
+    });
+  });
+});
+
+describe('programmaticReportFromDraft', () => {
+  it('falls back to draft-based sections when LLM is unavailable', () => {
+    const report = programmaticReportFromDraft(
+      `First sentence. Second sentence.
+
+- bullet one
+- bullet two
+- bullet three`,
+      [{ title: 'A', url: 'https://a.example', snippet: '' }],
+      [],
+      ['q1'],
+      null,
+    );
+    expect(report.executiveSummary).toContain('First sentence.');
+    expect(report.keyFindings).toEqual(['bullet one', 'bullet two', 'bullet three']);
+    expect(report.detailedAnalysis).toContain('bullet one');
+    expect(report.sources).toHaveLength(1);
+    expect(report.sources[0].index).toBe(1);
+    expect(report.methodology.queries).toEqual(['q1']);
+  });
+});
+
+describe('buildStructuredReport', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+  beforeEach(() => {
+    vi.clearAllMocks();
+    void mockedCreateSearchService;
+  });
+
+  it('uses LLM output when parseable', async () => {
+    const run = await buildStructuredReport({
+      draft: 'Draft body.',
+      topic: 'T',
+      summary: 'S',
+      sources: [{ title: 'A', url: 'https://a.example', snippet: '' }],
+      iterations: [],
+      queries: ['q1'],
+      finalScores: null,
+      modelId: 'm',
+      generateFn: vi.fn().mockResolvedValue(MOCK_REPORT) as never,
+    });
+    expect(run.source).toBe('llm');
+    expect(run.llmCallsAttempted).toBe(1);
+    expect(run.report.keyFindings.length).toBeGreaterThan(0);
+    expect(run.report.sources[0].url).toBe('https://a.example');
+  });
+
+  it('falls back to programmatic when LLM throws', async () => {
+    const run = await buildStructuredReport({
+      draft: 'Draft body. Second sentence.',
+      topic: 'T',
+      summary: 'S',
+      sources: [{ title: 'A', url: 'https://a.example', snippet: '' }],
+      iterations: [],
+      queries: ['q1'],
+      finalScores: null,
+      modelId: 'm',
+      generateFn: vi.fn().mockRejectedValue(new Error('boom')) as never,
+    });
+    expect(run.source).toBe('programmatic');
+    expect(run.llmCallsAttempted).toBe(1);
+    expect(run.report.detailedAnalysis).toContain('Draft body.');
+  });
+
+  it('falls back to programmatic when LLM output is unparseable', async () => {
+    const run = await buildStructuredReport({
+      draft: 'Draft. Second.',
+      topic: 'T',
+      summary: 'S',
+      sources: [],
+      iterations: [],
+      queries: [],
+      finalScores: null,
+      modelId: 'm',
+      generateFn: vi.fn().mockResolvedValue('totally bogus output') as never,
+    });
+    expect(run.source).toBe('programmatic');
+  });
+});
+
+describe('runResearchPipeline structured report integration', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+    process.env.MAX_RESEARCH_ITERATIONS = '5';
+    process.env.MAX_LLM_CALLS_PER_RESEARCH = '10';
+  });
+
+  function setupCommon() {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'topic', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: scope',
+        metadata: { kind: 'research_ready', summary: 'scope' },
+      },
+    ] as never);
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    } as never);
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-final',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'final',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+  }
+
+  it('persists the structured report in research_final metadata', async () => {
+    setupCommon();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft body [1] [2] [3].')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.report.executiveSummary).toContain('concise overview');
+      expect(out.report.keyFindings).toHaveLength(3);
+    }
+    const stored = mockedPrisma.message.create.mock.calls[0][0] as {
+      data: { metadata: { report?: { executiveSummary: string; keyFindings: string[] } } };
+    };
+    expect(stored.data.metadata.report).toBeDefined();
+    expect(stored.data.metadata.report!.executiveSummary).toContain('concise overview');
+    expect(stored.data.metadata.report!.keyFindings).toHaveLength(3);
+  });
+
+  it('emits a finalizing progress event with report stage', async () => {
+    setupCommon();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const stages: string[] = [];
+    await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+      onProgress: (p) => stages.push(p.stage),
+    });
+    expect(stages).toContain('finalizing');
+  });
+
+  it('falls back to programmatic report when LLM call budget is exhausted', async () => {
+    process.env.MAX_LLM_CALLS_PER_RESEARCH = '3';
+    setupCommon();
+    // 3 calls: planning, draft, critique (all_passed). No room for report → programmatic.
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce(
+        'Initial draft.\n- bullet one\n- bullet two\n- bullet three',
+      )
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.llmCallsUsed).toBe(3);
+      expect(out.report.keyFindings.length).toBeGreaterThan(0);
+      // Report sources should still be present
+      expect(out.report.sources).toHaveLength(3);
+    }
+    expect(mockedGenerate).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('getLatestResearchFinal', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns null when the conversation is not owned by the user', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: OTHER_USER_ID,
+      title: 't',
+    } as never);
+    const out = await getLatestResearchFinal(USER_ID, 'conv-1');
+    expect(out).toBeNull();
+  });
+
+  it('returns the latest research_final with parsed report', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Climate',
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      {
+        content: 'older final',
+        metadata: {
+          kind: 'research_final',
+          report: {
+            executiveSummary: 'old',
+            keyFindings: [],
+            detailedAnalysis: 'old',
+            sources: [],
+            methodology: {
+              queries: [],
+              iterationCount: 0,
+              finalScores: null,
+              factCheckSummary: {
+                totalClaimsExtracted: 0,
+                verifiedClaims: 0,
+                unverifiedClaims: 0,
+                notCheckedClaims: 0,
+              },
+            },
+          },
+        },
+      },
+    ] as never);
+    const out = await getLatestResearchFinal(USER_ID, 'conv-1');
+    expect(out).not.toBeNull();
+    expect(out!.topic).toBe('Climate');
+    expect(out!.report.executiveSummary).toBe('old');
+  });
+
+  it('returns null when no research_final messages exist', async () => {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 't',
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { content: 'hello', metadata: null },
+      { content: 'questions', metadata: { kind: 'clarifying_questions', questions: [] } },
+    ] as never);
+    const out = await getLatestResearchFinal(USER_ID, 'conv-1');
+    expect(out).toBeNull();
+  });
+});
+
+describe('GET /api/conversations/:id/research/pdf', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('requires auth', async () => {
+    const res = await request(app).get('/api/conversations/conv-1/research/pdf');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 404 when no research_final exists', async () => {
+    authedSession();
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 't',
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([] as never);
+
+    const res = await request(app)
+      .get('/api/conversations/conv-1/research/pdf')
+      .set('Cookie', 'session_id=session-1');
+    expect(res.status).toBe(404);
+  });
+
+  it('streams a PDF with the report content', async () => {
+    authedSession();
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Climate Topic',
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      {
+        content: 'final draft',
+        metadata: {
+          kind: 'research_final',
+          report: {
+            executiveSummary: 'Summary text.',
+            keyFindings: ['one', 'two'],
+            detailedAnalysis: 'Body.',
+            sources: [
+              { index: 1, title: 'A', url: 'https://a.example', reliability: 'verified' },
+            ],
+            methodology: {
+              queries: ['q1'],
+              iterationCount: 1,
+              finalScores: {
+                factual_accuracy: 5,
+                completeness: 5,
+                source_coverage: 5,
+                coherence: 5,
+                scope_alignment: 5,
+              },
+              factCheckSummary: {
+                totalClaimsExtracted: 0,
+                verifiedClaims: 0,
+                unverifiedClaims: 0,
+                notCheckedClaims: 0,
+              },
+            },
+          },
+        },
+      },
+    ] as never);
+
+    const res = await request(app)
+      .get('/api/conversations/conv-1/research/pdf')
+      .set('Cookie', 'session_id=session-1')
+      .buffer(true);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('application/pdf');
+    expect(res.headers['content-disposition']).toContain('attachment');
+    expect(res.headers['content-disposition']).toContain('.pdf');
+    const body = res.body as Buffer;
+    expect(body.length).toBeGreaterThan(500);
+    expect(body.slice(0, 4).toString()).toBe('%PDF');
+  });
+});
+
+describe('Follow-up messages in research mode with status=complete', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+    mockedPrisma.message.count.mockResolvedValue(0 as never);
+  });
+
+  it('injects research context into the model messages', async () => {
+    authedSession();
+    // Preflight (chat handler dispatch decision)
+    mockedPrisma.conversation.findUnique.mockResolvedValueOnce({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'complete',
+    } as never);
+    // appendUserMessage ownership
+    mockedPrisma.conversation.findUnique.mockResolvedValueOnce({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+    } as never);
+    // getLatestResearchFinal lookup
+    mockedPrisma.conversation.findUnique.mockResolvedValueOnce({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+    } as never);
+
+    mockedPrisma.message.create.mockResolvedValueOnce({
+      id: 'user-msg',
+      conversationId: 'conv-1',
+      role: 'user',
+      content: 'more detail please',
+      createdAt: new Date(),
+    } as never);
+    // appendUserMessage's history fetch
+    mockedPrisma.message.findMany.mockResolvedValueOnce([
+      { role: 'user', content: 'topic' },
+      { role: 'assistant', content: 'final draft' },
+      { role: 'user', content: 'more detail please' },
+    ] as never);
+    // getLatestResearchFinal's message fetch
+    mockedPrisma.message.findMany.mockResolvedValueOnce([
+      {
+        content: 'final draft',
+        metadata: {
+          kind: 'research_final',
+          report: {
+            executiveSummary: 'EXEC',
+            keyFindings: ['kf1'],
+            detailedAnalysis: 'body',
+            sources: [
+              { index: 1, title: 'A', url: 'https://a.example', reliability: 'verified' },
+            ],
+            methodology: {
+              queries: [],
+              iterationCount: 1,
+              finalScores: null,
+              factCheckSummary: {
+                totalClaimsExtracted: 0,
+                verifiedClaims: 0,
+                unverifiedClaims: 0,
+                notCheckedClaims: 0,
+              },
+            },
+          },
+        },
+      },
+    ] as never);
+
+    mockedPrisma.user.findUnique.mockResolvedValue({
+      preferredModel: 'openai:gpt-4o-mini',
+      streamingEnabled: false,
+    } as never);
+
+    mockedGenerate.mockResolvedValueOnce('Expanded answer.');
+    mockedPrisma.message.create.mockResolvedValueOnce({
+      id: 'asst-msg',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'Expanded answer.',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const res = await request(app)
+      .post('/api/conversations/conv-1/messages?stream=false')
+      .set('Cookie', 'session_id=session-1')
+      .send({ content: 'more detail please' });
+
+    expect(res.status).toBe(201);
+    const aiCall = mockedGenerate.mock.calls[0];
+    const llmMessages = aiCall[0] as Array<{ role: string; content: string }>;
+    const systemContents = llmMessages
+      .filter((m) => m.role === 'system')
+      .map((m) => m.content)
+      .join('\n');
+    expect(systemContents).toContain('[Research context for follow-up questions]');
+    expect(systemContents).toContain('EXEC');
+    expect(systemContents).toContain('https://a.example');
   });
 });
 

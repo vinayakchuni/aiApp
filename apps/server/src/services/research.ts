@@ -381,6 +381,23 @@ const REVISE_SYSTEM_PROMPT = `You are the research analyst who wrote the previou
 
 const CLAIM_EXTRACT_SYSTEM_PROMPT = `You are a fact checker preparing to verify a research draft. Read the draft and extract up to {{MAX_CLAIMS}} of the most important specific, verifiable factual claims (numbers, dates, named entities, attributed statements). Skip subjective opinions, obvious truisms, and meta-commentary. Output ONE claim per line in plain text. No numbering, no bullets, no quotes, no preamble. If the draft contains no verifiable claims, output the single token NO_CLAIMS.`;
 
+const REPORT_SYSTEM_PROMPT = `You are a research editor producing the final structured report. You will be given the topic, agreed scope, the numbered sources, and the final revised draft. Re-organize the draft into a clean, well-structured report. Do not invent new facts. Preserve the existing [1], [2], ... citation numbers that reference the supplied source list.
+
+Respond in EXACTLY this format and NOTHING ELSE:
+
+EXECUTIVE_SUMMARY:
+<2-4 sentence high-level summary suitable as a TL;DR>
+
+KEY_FINDINGS:
+- <finding 1, one sentence with citation(s) if relevant>
+- <finding 2>
+- <finding 3>
+- <optional finding 4>
+- <optional finding 5>
+
+DETAILED_ANALYSIS:
+<the main body of the report, organized into 2-5 paragraphs. Use the citations and the supplied sources. Do NOT repeat the executive summary verbatim. Do NOT list the sources here — they appear separately. Aim for 300-700 words.>`;
+
 export function parseSearchQueries(text: string): string[] {
   const lines = text
     .split('\n')
@@ -479,7 +496,8 @@ export type ResearchProgressStage =
   | 'writing_draft'
   | 'critiquing'
   | 'fact_checking'
-  | 'revising';
+  | 'revising'
+  | 'finalizing';
 
 export interface ResearchProgress {
   stage: ResearchProgressStage;
@@ -674,6 +692,257 @@ export function countVerifiedClaims(summary: FactCheckSummary): number {
   return summary.results.filter((r) => r.status === 'verified').length;
 }
 
+export type SourceReliability = 'verified' | 'unknown';
+
+export interface ReportSource {
+  index: number;
+  title: string;
+  url: string;
+  reliability: SourceReliability;
+}
+
+export interface ReportFactCheckSummary {
+  totalClaimsExtracted: number;
+  verifiedClaims: number;
+  unverifiedClaims: number;
+  notCheckedClaims: number;
+}
+
+export interface ReportMethodology {
+  queries: string[];
+  iterationCount: number;
+  finalScores: CritiqueScores | null;
+  factCheckSummary: ReportFactCheckSummary;
+}
+
+export interface StructuredReport {
+  executiveSummary: string;
+  keyFindings: string[];
+  detailedAnalysis: string;
+  sources: ReportSource[];
+  methodology: ReportMethodology;
+}
+
+export interface ParsedReportSections {
+  executiveSummary: string;
+  keyFindings: string[];
+  detailedAnalysis: string;
+}
+
+export function parseStructuredReport(text: string): ParsedReportSections | null {
+  const sumMatch = text.match(/EXECUTIVE_SUMMARY\s*:\s*([\s\S]*?)(?=\n\s*KEY_FINDINGS\s*:)/i);
+  const findMatch = text.match(/KEY_FINDINGS\s*:\s*([\s\S]*?)(?=\n\s*DETAILED_ANALYSIS\s*:)/i);
+  const detMatch = text.match(/DETAILED_ANALYSIS\s*:\s*([\s\S]*)$/i);
+  if (!sumMatch || !findMatch || !detMatch) return null;
+  const executiveSummary = sumMatch[1].trim();
+  const detailedAnalysis = detMatch[1].trim();
+  const findingsBlock = findMatch[1].trim();
+  const keyFindings: string[] = [];
+  const numbered = /^\s*(?:\d+[.)]|[-*•])\s*(.+)$/;
+  for (const raw of findingsBlock.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(numbered);
+    const value = (m ? m[1] : line).trim();
+    if (value.length > 0) keyFindings.push(value);
+  }
+  if (
+    executiveSummary.length === 0 ||
+    keyFindings.length === 0 ||
+    detailedAnalysis.length === 0
+  ) {
+    return null;
+  }
+  return { executiveSummary, keyFindings, detailedAnalysis };
+}
+
+export function buildReportUserPrompt(
+  topic: string,
+  summary: string,
+  draft: string,
+  sources: SearchResult[],
+): string {
+  const sourceBlock = sources
+    .map((s, i) => `[${i + 1}] ${s.title} — ${s.url}`)
+    .join('\n');
+  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}\n\nFINAL DRAFT TO RESTRUCTURE:\n${draft}\n\nProduce the structured report now.`;
+}
+
+export function computeReportSources(
+  sources: SearchResult[],
+  iterations: CritiqueIterationRecord[],
+): ReportSource[] {
+  const verifiedUrls = new Set<string>();
+  for (const it of iterations) {
+    if (!it.factCheck) continue;
+    for (const r of it.factCheck.results) {
+      if (r.status === 'verified') {
+        for (const u of r.supportingUrls) verifiedUrls.add(u);
+      }
+    }
+  }
+  return sources.map((s, i) => ({
+    index: i + 1,
+    title: s.title,
+    url: s.url,
+    reliability: verifiedUrls.has(s.url) ? 'verified' : 'unknown',
+  }));
+}
+
+export function computeReportMethodology(
+  queries: string[],
+  iterations: CritiqueIterationRecord[],
+  finalScores: CritiqueScores | null,
+): ReportMethodology {
+  let total = 0;
+  let verified = 0;
+  let unverified = 0;
+  let notChecked = 0;
+  for (const it of iterations) {
+    if (!it.factCheck) continue;
+    total += it.factCheck.results.length;
+    for (const r of it.factCheck.results) {
+      if (r.status === 'verified') verified += 1;
+      else if (r.status === 'unverified') unverified += 1;
+      else notChecked += 1;
+    }
+  }
+  return {
+    queries,
+    iterationCount: iterations.length,
+    finalScores,
+    factCheckSummary: {
+      totalClaimsExtracted: total,
+      verifiedClaims: verified,
+      unverifiedClaims: unverified,
+      notCheckedClaims: notChecked,
+    },
+  };
+}
+
+const FALLBACK_EXECUTIVE_SUMMARY_SENTENCES = 2;
+
+export function programmaticReportFromDraft(
+  draft: string,
+  sources: SearchResult[],
+  iterations: CritiqueIterationRecord[],
+  queries: string[],
+  finalScores: CritiqueScores | null,
+): StructuredReport {
+  const cleaned = draft.trim();
+  const sentences = cleaned
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const executiveSummary =
+    sentences.slice(0, FALLBACK_EXECUTIVE_SUMMARY_SENTENCES).join(' ') ||
+    cleaned.slice(0, 240);
+  const bulletLines = cleaned
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => /^(?:\d+[.)]|[-*•])\s+/.test(l))
+    .map((l) => l.replace(/^(?:\d+[.)]|[-*•])\s+/, '').trim());
+  const keyFindings =
+    bulletLines.length >= 3 ? bulletLines.slice(0, 5) : sentences.slice(0, 5);
+  return {
+    executiveSummary,
+    keyFindings: keyFindings.length > 0 ? keyFindings : [cleaned.slice(0, 200)],
+    detailedAnalysis: cleaned,
+    sources: computeReportSources(sources, iterations),
+    methodology: computeReportMethodology(queries, iterations, finalScores),
+  };
+}
+
+export interface BuildStructuredReportOptions {
+  draft: string;
+  topic: string;
+  summary: string;
+  sources: SearchResult[];
+  iterations: CritiqueIterationRecord[];
+  queries: string[];
+  finalScores: CritiqueScores | null;
+  modelId: string;
+  generateFn?: typeof generateAssistantText;
+  abortSignal?: AbortSignal;
+}
+
+export interface BuildStructuredReportRun {
+  report: StructuredReport;
+  llmCallsAttempted: number;
+  source: 'llm' | 'programmatic';
+}
+
+export async function buildStructuredReport(
+  opts: BuildStructuredReportOptions,
+): Promise<BuildStructuredReportRun> {
+  const {
+    draft,
+    topic,
+    summary,
+    sources,
+    iterations,
+    queries,
+    finalScores,
+    modelId,
+    generateFn = generateAssistantText,
+  } = opts;
+
+  let text: string;
+  try {
+    text = await generateFn(
+      [
+        { role: 'system', content: REPORT_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: buildReportUserPrompt(topic, summary, draft, sources),
+        },
+      ],
+      modelId,
+    );
+  } catch (err) {
+    console.error('Report generation failed:', err);
+    return {
+      report: programmaticReportFromDraft(
+        draft,
+        sources,
+        iterations,
+        queries,
+        finalScores,
+      ),
+      llmCallsAttempted: 1,
+      source: 'programmatic',
+    };
+  }
+
+  const parsed = parseStructuredReport(text);
+  if (!parsed) {
+    console.warn('Structured-report parse failed; using programmatic fallback');
+    return {
+      report: programmaticReportFromDraft(
+        draft,
+        sources,
+        iterations,
+        queries,
+        finalScores,
+      ),
+      llmCallsAttempted: 1,
+      source: 'programmatic',
+    };
+  }
+
+  return {
+    report: {
+      executiveSummary: parsed.executiveSummary,
+      keyFindings: parsed.keyFindings,
+      detailedAnalysis: parsed.detailedAnalysis,
+      sources: computeReportSources(sources, iterations),
+      methodology: computeReportMethodology(queries, iterations, finalScores),
+    },
+    llmCallsAttempted: 1,
+    source: 'llm',
+  };
+}
+
 export function draftSimilarity(a: string, b: string): number {
   const tokensA = new Set(
     a.toLowerCase().split(/\s+/).filter((t) => t.length > 0),
@@ -755,6 +1024,7 @@ export type RunResearchOutcome =
       finalScores: CritiqueScores | null;
       exitReason: ResearchExitReason;
       llmCallsUsed: number;
+      report: StructuredReport;
     }
   | { kind: 'not-found' }
   | { kind: 'wrong-status' }
@@ -1157,6 +1427,32 @@ export async function runResearchPipeline(
     }
   }
 
+  let structuredReport: StructuredReport;
+  if (llmCallsRemaining() >= 1 && !abortSignal?.aborted) {
+    onProgress?.({ stage: 'finalizing', detail: 'Structuring the final report' });
+    const reportRun = await buildStructuredReport({
+      draft: currentDraft,
+      topic,
+      summary,
+      sources,
+      iterations,
+      queries,
+      finalScores,
+      modelId,
+      abortSignal,
+    });
+    llmCallsUsed += reportRun.llmCallsAttempted;
+    structuredReport = reportRun.report;
+  } else {
+    structuredReport = programmaticReportFromDraft(
+      currentDraft,
+      sources,
+      iterations,
+      queries,
+      finalScores,
+    );
+  }
+
   const finalMetadata: Record<string, unknown> = {
     kind: 'research_final',
     queries,
@@ -1174,6 +1470,7 @@ export async function runResearchPipeline(
     iterationCount: iterations.length,
     exitReason,
     llmCallsUsed,
+    report: structuredReport,
   };
 
   const assistantMessage = await prisma.message.create({
@@ -1200,5 +1497,45 @@ export async function runResearchPipeline(
     finalScores,
     exitReason,
     llmCallsUsed,
+    report: structuredReport,
   };
+}
+
+export interface ResearchFinalRecord {
+  conversationId: string;
+  draft: string;
+  report: StructuredReport;
+  topic: string;
+}
+
+export async function getLatestResearchFinal(
+  userId: string,
+  conversationId: string,
+): Promise<ResearchFinalRecord | null> {
+  const conversation = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: { id: true, userId: true, title: true },
+  });
+  if (!conversation || conversation.userId !== userId) return null;
+
+  const messages = await prisma.message.findMany({
+    where: { conversationId, role: 'assistant' },
+    orderBy: { createdAt: 'desc' },
+    select: { content: true, metadata: true },
+  });
+  for (const m of messages) {
+    const md = m.metadata;
+    if (!md || typeof md !== 'object') continue;
+    const kind = (md as { kind?: unknown }).kind;
+    if (kind !== 'research_final') continue;
+    const report = (md as { report?: unknown }).report;
+    if (!report || typeof report !== 'object') continue;
+    return {
+      conversationId,
+      draft: m.content,
+      report: report as StructuredReport,
+      topic: conversation.title,
+    };
+  }
+  return null;
 }

@@ -10,10 +10,12 @@ import type {
   FactCheckResult,
   Message,
   MessageMetadata,
+  ReportSource,
   ResearchCompleteEvent,
   ResearchFailedEvent,
   ResearchProgressEvent,
   ResearchSource,
+  StructuredReport,
   UserResponse,
   UserSettingsResponse,
 } from '@ai-app/shared';
@@ -80,19 +82,211 @@ function factCheckBadgeLabel(status: FactCheckResult['status']): string {
   }
 }
 
+function ReportSourceList({ sources }: { sources: ReportSource[] }) {
+  return (
+    <ol className="mt-2 space-y-1 pl-4">
+      {sources.map((s) => (
+        <li key={s.url || s.index} className="truncate">
+          <span className="text-gray-500">[{s.index}] </span>
+          <a
+            href={s.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-600 hover:underline"
+          >
+            {s.title || s.url}
+          </a>
+          {s.reliability === 'verified' && (
+            <span className="ml-1 inline-block rounded bg-green-100 px-1 text-[10px] font-semibold uppercase text-green-800">
+              verified
+            </span>
+          )}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function PlainSourceList({ sources }: { sources: ResearchSource[] }) {
+  return (
+    <ol className="mt-2 space-y-1 pl-4">
+      {sources.map((s, idx) => (
+        <li key={s.url} className="truncate">
+          <span className="text-gray-500">[{idx + 1}] </span>
+          <a
+            href={s.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-600 hover:underline"
+            title={s.snippet}
+          >
+            {s.title || s.url}
+          </a>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function MethodologyView({ methodology }: { methodology: StructuredReport['methodology'] }) {
+  const fc = methodology.factCheckSummary;
+  return (
+    <div className="mt-2 space-y-2 text-[12px]">
+      <div>
+        <div className="font-semibold text-gray-700">Search queries used</div>
+        {methodology.queries.length === 0 ? (
+          <p className="italic text-gray-500">(none)</p>
+        ) : (
+          <ul className="list-disc pl-5">
+            {methodology.queries.map((q, i) => (
+              <li key={`${i}-${q}`}>{q}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div>
+        <span className="font-semibold text-gray-700">Iterations: </span>
+        {methodology.iterationCount}
+      </div>
+      {methodology.finalScores && (
+        <div>
+          <div className="font-semibold text-gray-700">Final scores (1-5)</div>
+          <ul className="grid grid-cols-2 gap-x-3 pl-5">
+            {Object.entries(methodology.finalScores).map(([k, v]) => (
+              <li key={k}>
+                {k.replace(/_/g, ' ')}: <strong>{v}</strong>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <div>
+        <div className="font-semibold text-gray-700">Fact-check summary</div>
+        <ul className="grid grid-cols-2 gap-x-3 pl-5">
+          <li>Total claims: {fc.totalClaimsExtracted}</li>
+          <li>Verified: {fc.verifiedClaims}</li>
+          <li>Unverified: {fc.unverifiedClaims}</li>
+          <li>Not checked: {fc.notCheckedClaims}</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 function ResearchFinalPanel({
   metadata,
+  conversationId,
+  onDownloadError,
 }: {
   metadata: ResearchFinalMetadata;
+  conversationId: string;
+  onDownloadError: (msg: string) => void;
 }) {
   const factCheck = latestFactCheck(metadata.iterations);
+  const report = metadata.report ?? null;
   const sources: ResearchSource[] = metadata.sources ?? [];
-  if (sources.length === 0 && !factCheck) return null;
+  const [isDownloading, setIsDownloading] = useState(false);
+
+  async function handleDownload() {
+    if (isDownloading) return;
+    setIsDownloading(true);
+    try {
+      const res = await fetch(
+        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/conversations/${conversationId}/research/pdf`,
+        { credentials: 'include' },
+      );
+      if (!res.ok) {
+        onDownloadError('Could not download PDF.');
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'research-report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+      onDownloadError('Network error while downloading PDF.');
+    } finally {
+      setIsDownloading(false);
+    }
+  }
+
+  if (!report && sources.length === 0 && !factCheck) return null;
 
   return (
     <div className="mt-3 space-y-3 border-t border-gray-200 pt-3 text-xs text-gray-700">
+      {report && (
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+            Structured report
+          </span>
+          <button
+            type="button"
+            onClick={() => void handleDownload()}
+            disabled={isDownloading}
+            className="rounded-md border border-purple-300 bg-white px-3 py-1 text-[11px] font-semibold text-purple-700 hover:bg-purple-50 disabled:opacity-50"
+          >
+            {isDownloading ? 'Generating...' : 'Download PDF'}
+          </button>
+        </div>
+      )}
+      {report && (
+        <>
+          <details open className="rounded-md border border-purple-200 bg-white p-2">
+            <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+              Executive Summary
+            </summary>
+            <p className="mt-2 whitespace-pre-wrap leading-relaxed text-gray-800">
+              {report.executiveSummary}
+            </p>
+          </details>
+          <details open className="rounded-md border border-purple-200 bg-white p-2">
+            <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+              Key Findings
+            </summary>
+            <ul className="mt-2 list-disc space-y-1 pl-5 leading-relaxed text-gray-800">
+              {report.keyFindings.map((f, i) => (
+                <li key={i}>{f}</li>
+              ))}
+            </ul>
+          </details>
+          <details className="rounded-md border border-purple-200 bg-white p-2">
+            <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+              Detailed Analysis
+            </summary>
+            <p className="mt-2 whitespace-pre-wrap leading-relaxed text-gray-800">
+              {report.detailedAnalysis}
+            </p>
+          </details>
+          <details className="rounded-md border border-purple-200 bg-white p-2">
+            <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+              Sources ({report.sources.length})
+            </summary>
+            <ReportSourceList sources={report.sources} />
+          </details>
+          <details className="rounded-md border border-purple-200 bg-white p-2">
+            <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+              Methodology
+            </summary>
+            <MethodologyView methodology={report.methodology} />
+          </details>
+        </>
+      )}
+      {!report && sources.length > 0 && (
+        <details className="rounded-md border border-gray-200 bg-gray-50 p-2">
+          <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-gray-700">
+            Sources ({sources.length})
+          </summary>
+          <PlainSourceList sources={sources} />
+        </details>
+      )}
       {factCheck && (
-        <details open className="rounded-md border border-purple-200 bg-purple-50/30 p-2">
+        <details className="rounded-md border border-purple-200 bg-purple-50/30 p-2">
           <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
             Fact-checked claims (round {factCheck.iteration} — {factCheck.results.length})
           </summary>
@@ -133,29 +327,6 @@ function ResearchFinalPanel({
           )}
         </details>
       )}
-      {sources.length > 0 && (
-        <details className="rounded-md border border-gray-200 bg-gray-50 p-2">
-          <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-gray-700">
-            Sources ({sources.length})
-          </summary>
-          <ol className="mt-2 space-y-1 pl-4">
-            {sources.map((s, idx) => (
-              <li key={s.url} className="truncate">
-                <span className="text-gray-500">[{idx + 1}] </span>
-                <a
-                  href={s.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-600 hover:underline"
-                  title={s.snippet}
-                >
-                  {s.title || s.url}
-                </a>
-              </li>
-            ))}
-          </ol>
-        </details>
-      )}
     </div>
   );
 }
@@ -176,6 +347,8 @@ function stageLabel(stage: ResearchProgressEvent['stage']): string {
       return 'Fact-checking claims...';
     case 'revising':
       return 'Revising the draft...';
+    case 'finalizing':
+      return 'Structuring the final report...';
   }
 }
 
@@ -1201,8 +1374,12 @@ export default function Home() {
                           ) : (
                             m.content
                           )}
-                          {researchFinal && (
-                            <ResearchFinalPanel metadata={researchFinal} />
+                          {researchFinal && activeConversation && (
+                            <ResearchFinalPanel
+                              metadata={researchFinal}
+                              conversationId={activeConversation.id}
+                              onDownloadError={(msg) => addToast(msg)}
+                            />
                           )}
                         </div>
                       </li>

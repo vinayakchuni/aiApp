@@ -26,7 +26,9 @@ import {
   startResearch,
   processClarifyingAnswer,
   runResearchPipeline,
+  getLatestResearchFinal,
 } from '../services/research';
+import { generateResearchPdf } from '../services/pdf';
 import { prisma } from '../lib/db';
 import type { ConversationMode } from '../generated/prisma/enums';
 
@@ -400,6 +402,36 @@ conversationsRouter.post(
   },
 );
 
+conversationsRouter.get(
+  '/:id/research/pdf',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const id = String(req.params.id);
+    const record = await getLatestResearchFinal(req.user!.id, id);
+    if (!record) {
+      res.status(404).json({ success: false, error: 'No research report found' });
+      return;
+    }
+    try {
+      const pdf = await generateResearchPdf({
+        title: record.topic,
+        report: record.report,
+      });
+      const safeName = record.topic.replace(/[^A-Za-z0-9-_]+/g, '_').slice(0, 60) || 'report';
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${safeName}.pdf"`,
+      );
+      res.setHeader('Content-Length', String(pdf.length));
+      res.end(pdf);
+    } catch (err) {
+      console.error('PDF generation failed:', err);
+      res.status(500).json({ success: false, error: 'Could not generate PDF' });
+    }
+  },
+);
+
 conversationsRouter.post(
   '/:id/messages',
   csrfProtection,
@@ -480,12 +512,34 @@ conversationsRouter.post(
 
     const { userMessage, history } = result;
     const files = await listFilesForConversation(id);
+
+    let researchContext: Parameters<typeof buildModelMessages>[0]['researchContext'] = null;
+    if (
+      conversationMeta?.mode === 'research' &&
+      conversationMeta.researchStatus === 'complete'
+    ) {
+      const record = await getLatestResearchFinal(req.user!.id, id);
+      if (record) {
+        researchContext = {
+          topic: record.topic,
+          executiveSummary: record.report.executiveSummary,
+          keyFindings: record.report.keyFindings,
+          sources: record.report.sources.map((s) => ({
+            index: s.index,
+            title: s.title,
+            url: s.url,
+          })),
+        };
+      }
+    }
+
     const modelMessages = buildModelMessages({
       history,
       files: files.map((f) => ({
         originalName: f.originalName,
         extractedText: f.extractedText,
       })),
+      researchContext,
     });
 
     const userSettings = await prisma.user.findUnique({

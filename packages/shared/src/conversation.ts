@@ -66,6 +66,37 @@ export type ResearchExitReason =
   | 'budget_exhausted'
   | 'critique_parse_failed';
 
+export type SourceReliability = 'verified' | 'unknown';
+
+export interface ReportSource {
+  index: number;
+  title: string;
+  url: string;
+  reliability: SourceReliability;
+}
+
+export interface ReportFactCheckSummary {
+  totalClaimsExtracted: number;
+  verifiedClaims: number;
+  unverifiedClaims: number;
+  notCheckedClaims: number;
+}
+
+export interface ReportMethodology {
+  queries: string[];
+  iterationCount: number;
+  finalScores: CritiqueScores | null;
+  factCheckSummary: ReportFactCheckSummary;
+}
+
+export interface StructuredReport {
+  executiveSummary: string;
+  keyFindings: string[];
+  detailedAnalysis: string;
+  sources: ReportSource[];
+  methodology: ReportMethodology;
+}
+
 export type MessageMetadata =
   | { kind: 'clarifying_questions'; questions: string[] }
   | { kind: 'research_ready'; summary?: string }
@@ -85,6 +116,7 @@ export type MessageMetadata =
       iterationCount: number;
       exitReason: ResearchExitReason;
       llmCallsUsed: number;
+      report?: StructuredReport;
     }
   | { kind: string; [key: string]: unknown };
 
@@ -95,7 +127,8 @@ export type ResearchProgressStage =
   | 'writing_draft'
   | 'critiquing'
   | 'fact_checking'
-  | 'revising';
+  | 'revising'
+  | 'finalizing';
 
 export interface ResearchProgressEvent {
   stage: ResearchProgressStage;
