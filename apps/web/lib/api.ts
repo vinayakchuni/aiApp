@@ -7,6 +7,7 @@ export async function fetchCsrfToken(): Promise<string> {
 
   const res = await fetch(`${API_URL}/api/auth/csrf-token`, {
     credentials: 'include',
+    cache: 'no-store',
   });
   const data = await res.json();
   csrfToken = data.csrfToken as string;
@@ -36,6 +37,7 @@ export async function apiGet(path: string): Promise<Response> {
   return fetch(`${API_URL}${path}`, {
     method: 'GET',
     credentials: 'include',
+    cache: 'no-store',
   });
 }
 

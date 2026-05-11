@@ -30,4 +30,10 @@ app.use('/api/auth', authRouter);
 app.use('/api/conversations', conversationsRouter);
 app.use('/api/users', usersRouter);
 
+// Return JSON for unhandled errors instead of default HTML
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error(err);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
+
 export { app };
