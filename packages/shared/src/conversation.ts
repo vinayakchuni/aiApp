@@ -35,12 +35,28 @@ export type CritiqueCriterion =
 
 export type CritiqueScores = Record<CritiqueCriterion, number>;
 
+export type FactCheckStatus = 'verified' | 'unverified' | 'not_checked';
+
+export interface FactCheckResult {
+  claim: string;
+  status: FactCheckStatus;
+  supportingUrls: string[];
+}
+
+export interface FactCheckSummary {
+  results: FactCheckResult[];
+  claimsExtracted: number;
+  searchesUsed: number;
+  budgetExhausted: boolean;
+}
+
 export interface CritiqueIterationRecord {
   iteration: number;
   scores: CritiqueScores;
   critique: string;
   weakest: CritiqueCriterion[];
   revised: boolean;
+  factCheck?: FactCheckSummary;
 }
 
 export type ResearchExitReason =
@@ -78,6 +94,7 @@ export type ResearchProgressStage =
   | 'analyzing_sources'
   | 'writing_draft'
   | 'critiquing'
+  | 'fact_checking'
   | 'revising';
 
 export interface ResearchProgressEvent {
@@ -89,6 +106,8 @@ export interface ResearchProgressEvent {
   maxIterations?: number;
   weakestCriteria?: CritiqueCriterion[];
   scores?: CritiqueScores;
+  claimsExtracted?: number;
+  claimsVerified?: number;
 }
 
 export interface ResearchCompleteEvent {

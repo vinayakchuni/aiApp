@@ -17,6 +17,7 @@ export const MAX_SEARCH_QUERIES = 5;
 
 const DEFAULT_MAX_RESEARCH_ITERATIONS = 5;
 const DEFAULT_MAX_LLM_CALLS_PER_RESEARCH = 10;
+const DEFAULT_MAX_FACT_CHECK_CLAIMS = 8;
 
 export function getMaxResearchIterations(): number {
   const raw = process.env.MAX_RESEARCH_ITERATIONS;
@@ -32,6 +33,13 @@ export function getMaxLlmCallsPerResearch(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_LLM_CALLS_PER_RESEARCH;
 }
 
+export function getMaxFactCheckClaims(): number {
+  const raw = process.env.MAX_FACT_CHECK_CLAIMS_PER_ITERATION;
+  if (!raw) return DEFAULT_MAX_FACT_CHECK_CLAIMS;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FACT_CHECK_CLAIMS;
+}
+
 export const PASS_SCORE_THRESHOLD = 4;
 export const CONVERGENCE_SIMILARITY_THRESHOLD = 0.95;
 export const CRITIQUE_CRITERIA = [
@@ -44,12 +52,28 @@ export const CRITIQUE_CRITERIA = [
 export type CritiqueCriterion = (typeof CRITIQUE_CRITERIA)[number];
 export type CritiqueScores = Record<CritiqueCriterion, number>;
 
+export type FactCheckStatus = 'verified' | 'unverified' | 'not_checked';
+
+export interface FactCheckResult {
+  claim: string;
+  status: FactCheckStatus;
+  supportingUrls: string[];
+}
+
+export interface FactCheckSummary {
+  results: FactCheckResult[];
+  claimsExtracted: number;
+  searchesUsed: number;
+  budgetExhausted: boolean;
+}
+
 export interface CritiqueIterationRecord {
   iteration: number;
   scores: CritiqueScores;
   critique: string;
   weakest: CritiqueCriterion[];
   revised: boolean;
+  factCheck?: FactCheckSummary;
 }
 
 export type ResearchExitReason =
@@ -353,7 +377,9 @@ scope_alignment: <integer 1-5>
 CRITIQUE:
 <2-4 sentences identifying the most important issues to fix, focused on the lowest-scored criteria. Be specific.>`;
 
-const REVISE_SYSTEM_PROMPT = `You are the research analyst who wrote the previous draft. A senior editor has critiqued it. Rewrite the entire draft, addressing every issue raised in the critique. Keep the same structure (one-paragraph intro, 3-5 findings with citations, brief conclusion) and the same numbered citation style ([1], [2], etc.) referring to the same source list. Do not invent new sources. Do not include the critique or scores in your output — only the revised draft prose. Aim for 500-800 words.`;
+const REVISE_SYSTEM_PROMPT = `You are the research analyst who wrote the previous draft. A senior editor has critiqued it, and a fact checker has verified specific claims. Rewrite the entire draft, addressing every issue raised in the critique AND correcting or removing any claim flagged as unverified. Keep the same structure (one-paragraph intro, 3-5 findings with citations, brief conclusion) and the same numbered citation style ([1], [2], etc.) referring to the same source list. Do not invent new sources. Do not include the critique, scores, or fact-check annotations in your output — only the revised draft prose. Aim for 500-800 words.`;
+
+const CLAIM_EXTRACT_SYSTEM_PROMPT = `You are a fact checker preparing to verify a research draft. Read the draft and extract up to {{MAX_CLAIMS}} of the most important specific, verifiable factual claims (numbers, dates, named entities, attributed statements). Skip subjective opinions, obvious truisms, and meta-commentary. Output ONE claim per line in plain text. No numbering, no bullets, no quotes, no preamble. If the draft contains no verifiable claims, output the single token NO_CLAIMS.`;
 
 export function parseSearchQueries(text: string): string[] {
   const lines = text
@@ -452,6 +478,7 @@ export type ResearchProgressStage =
   | 'analyzing_sources'
   | 'writing_draft'
   | 'critiquing'
+  | 'fact_checking'
   | 'revising';
 
 export interface ResearchProgress {
@@ -463,6 +490,8 @@ export interface ResearchProgress {
   maxIterations?: number;
   weakestCriteria?: CritiqueCriterion[];
   scores?: CritiqueScores;
+  claimsExtracted?: number;
+  claimsVerified?: number;
 }
 
 export interface CritiqueParseResult {
@@ -509,6 +538,142 @@ export function allCriteriaPassed(
   return CRITIQUE_CRITERIA.every((c) => scores[c] >= threshold);
 }
 
+export function parseClaims(text: string, max: number): string[] {
+  const trimmed = text.trim();
+  if (trimmed.length === 0 || /^no_?claims$/i.test(trimmed)) return [];
+  const lines = trimmed.split('\n').map((l) => l.trim()).filter(Boolean);
+  const claims: string[] = [];
+  const seen = new Set<string>();
+  const numbered = /^\s*(?:\d+[.)]|[-*•])\s*(.+)$/;
+  for (const line of lines) {
+    if (/^no_?claims$/i.test(line)) continue;
+    const match = line.match(numbered);
+    const value = (match ? match[1] : line).trim();
+    const stripped = value.replace(/^["'`]+|["'`]+$/g, '').trim();
+    if (stripped.length === 0) continue;
+    const key = stripped.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    claims.push(stripped);
+    if (claims.length >= max) break;
+  }
+  return claims;
+}
+
+export function buildClaimExtractPrompt(draft: string, max: number): LLMMessage[] {
+  return [
+    {
+      role: 'system',
+      content: CLAIM_EXTRACT_SYSTEM_PROMPT.replace('{{MAX_CLAIMS}}', String(max)),
+    },
+    {
+      role: 'user',
+      content: `DRAFT:\n${draft}\n\nList the most important verifiable claims, one per line.`,
+    },
+  ];
+}
+
+export interface FactCheckOptions {
+  draft: string;
+  maxClaims: number;
+  search: SearchService;
+  modelId: string;
+  generateFn?: typeof generateAssistantText;
+  abortSignal?: AbortSignal;
+}
+
+export interface FactCheckRun {
+  summary: FactCheckSummary;
+  llmCallsAttempted: number;
+}
+
+export async function factCheckDraft(opts: FactCheckOptions): Promise<FactCheckRun> {
+  const {
+    draft,
+    maxClaims,
+    search,
+    modelId,
+    generateFn = generateAssistantText,
+    abortSignal,
+  } = opts;
+
+  if (search.remaining() <= 0) {
+    return {
+      summary: {
+        results: [],
+        claimsExtracted: 0,
+        searchesUsed: 0,
+        budgetExhausted: true,
+      },
+      llmCallsAttempted: 0,
+    };
+  }
+
+  let claimsText: string;
+  try {
+    claimsText = await generateFn(buildClaimExtractPrompt(draft, maxClaims), modelId);
+  } catch (err) {
+    console.error('Claim extraction failed:', err);
+    return {
+      summary: {
+        results: [],
+        claimsExtracted: 0,
+        searchesUsed: 0,
+        budgetExhausted: false,
+      },
+      llmCallsAttempted: 1,
+    };
+  }
+  const claims = parseClaims(claimsText, maxClaims);
+
+  const results: FactCheckResult[] = [];
+  let searchesUsed = 0;
+  let budgetExhausted = false;
+
+  for (const claim of claims) {
+    if (abortSignal?.aborted) break;
+    if (search.remaining() <= 0) {
+      budgetExhausted = true;
+      results.push({ claim, status: 'not_checked', supportingUrls: [] });
+      continue;
+    }
+    try {
+      const hits = await search.search(claim);
+      searchesUsed += 1;
+      const urls = hits.map((h) => h.url).filter(Boolean).slice(0, 3);
+      const status: FactCheckStatus = urls.length > 0 ? 'verified' : 'unverified';
+      results.push({ claim, status, supportingUrls: urls });
+    } catch (err) {
+      if (err instanceof SearchBudgetExhaustedError) {
+        budgetExhausted = true;
+        results.push({ claim, status: 'not_checked', supportingUrls: [] });
+        continue;
+      }
+      if (err instanceof SearchProviderError) {
+        searchesUsed += 1;
+        results.push({ claim, status: 'unverified', supportingUrls: [] });
+        continue;
+      }
+      console.error(`Unexpected fact-check error for "${claim}":`, err);
+      results.push({ claim, status: 'unverified', supportingUrls: [] });
+    }
+  }
+
+  return {
+    summary: {
+      results,
+      claimsExtracted: claims.length,
+      searchesUsed,
+      budgetExhausted,
+    },
+    llmCallsAttempted: 1,
+  };
+}
+
+export function countVerifiedClaims(summary: FactCheckSummary): number {
+  return summary.results.filter((r) => r.status === 'verified').length;
+}
+
 export function draftSimilarity(a: string, b: string): number {
   const tokensA = new Set(
     a.toLowerCase().split(/\s+/).filter((t) => t.length > 0),
@@ -540,6 +705,22 @@ function buildCritiqueUserPrompt(
   return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}${buildFileSummaryBlock(files)}\n\nDRAFT TO CRITIQUE:\n${draft}\n\nScore the draft now.`;
 }
 
+function buildFactCheckBlock(factCheck: FactCheckSummary | undefined): string {
+  if (!factCheck || factCheck.results.length === 0) return '';
+  const lines = factCheck.results.map((r) => {
+    const label =
+      r.status === 'verified'
+        ? 'VERIFIED'
+        : r.status === 'unverified'
+          ? 'UNVERIFIED'
+          : 'NOT CHECKED (budget exhausted)';
+    const support =
+      r.supportingUrls.length > 0 ? ` (supporting: ${r.supportingUrls.join(', ')})` : '';
+    return `- [${label}] ${r.claim}${support}`;
+  });
+  return `\n\nFACT-CHECK RESULTS:\n${lines.join('\n')}\n\nWhen revising, remove or qualify any UNVERIFIED claim, prefer wording supported by VERIFIED claims, and flag NOT CHECKED claims as tentative.`;
+}
+
 function buildReviseUserPrompt(
   topic: string,
   summary: string,
@@ -549,6 +730,7 @@ function buildReviseUserPrompt(
   sources: SearchResult[],
   files: ResearchFile[],
   fullTextFiles: ResearchFile[],
+  factCheck?: FactCheckSummary,
 ): string {
   const sourceBlock = sources
     .map(
@@ -559,7 +741,7 @@ function buildReviseUserPrompt(
   const scoresBlock = CRITIQUE_CRITERIA.map(
     (c) => `${c}: ${scores[c]}`,
   ).join('\n');
-  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}${buildFileSummaryBlock(files)}${buildFullFileBlock(fullTextFiles)}\n\nPREVIOUS DRAFT:\n${previousDraft}\n\nEDITOR SCORES (1-5):\n${scoresBlock}\n\nEDITOR CRITIQUE:\n${critique}\n\nRewrite the draft now, addressing every issue raised.`;
+  return `TOPIC: ${topic}\nSCOPE: ${summary}\n\nNUMBERED SOURCES:\n${sourceBlock}${buildFileSummaryBlock(files)}${buildFullFileBlock(fullTextFiles)}\n\nPREVIOUS DRAFT:\n${previousDraft}\n\nEDITOR SCORES (1-5):\n${scoresBlock}\n\nEDITOR CRITIQUE:\n${critique}${buildFactCheckBlock(factCheck)}\n\nRewrite the draft now, addressing every issue raised.`;
 }
 
 export type RunResearchOutcome =
@@ -888,6 +1070,44 @@ export async function runResearchPipeline(
 
     if (abortSignal?.aborted) return { kind: 'aborted' };
 
+    let factCheckSummary: FactCheckSummary | undefined;
+    if (search.remaining() > 0) {
+      onProgress?.({
+        stage: 'fact_checking',
+        detail: `Fact-check round ${i} — extracting claims`,
+        iteration: i,
+        maxIterations,
+      });
+      const fc = await factCheckDraft({
+        draft: currentDraft,
+        maxClaims: getMaxFactCheckClaims(),
+        search,
+        modelId,
+        abortSignal,
+      });
+      llmCallsUsed += fc.llmCallsAttempted;
+      if (fc.llmCallsAttempted > 0) {
+        factCheckSummary = fc.summary;
+        record.factCheck = factCheckSummary;
+        const verified = countVerifiedClaims(fc.summary);
+        onProgress?.({
+          stage: 'fact_checking',
+          detail: `Fact-check round ${i} — ${verified}/${fc.summary.results.length} claim(s) verified`,
+          iteration: i,
+          maxIterations,
+          claimsExtracted: fc.summary.claimsExtracted,
+          claimsVerified: verified,
+        });
+      }
+
+      if (abortSignal?.aborted) return { kind: 'aborted' };
+
+      if (llmCallsRemaining() < 1) {
+        exitReason = 'budget_exhausted';
+        break;
+      }
+    }
+
     onProgress?.({
       stage: 'revising',
       detail: `Revision ${i} of ${maxIterations - 1} — improving ${weakest
@@ -916,6 +1136,7 @@ export async function runResearchPipeline(
               sources,
               researchFiles,
               requestedFiles,
+              factCheckSummary,
             ),
           },
         ],
@@ -947,6 +1168,7 @@ export async function runResearchPipeline(
       critique: it.critique,
       weakest: it.weakest,
       revised: it.revised,
+      ...(it.factCheck ? { factCheck: it.factCheck } : {}),
     })),
     finalScores,
     iterationCount: iterations.length,

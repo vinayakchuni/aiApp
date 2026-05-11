@@ -6,10 +6,14 @@ import type {
   ConversationFile,
   ConversationMode,
   ConversationWithMessages,
+  CritiqueIterationRecord,
+  FactCheckResult,
   Message,
+  MessageMetadata,
   ResearchCompleteEvent,
   ResearchFailedEvent,
   ResearchProgressEvent,
+  ResearchSource,
   UserResponse,
   UserSettingsResponse,
 } from '@ai-app/shared';
@@ -28,6 +32,134 @@ interface Toast {
 
 let toastCounter = 0;
 
+type ResearchFinalMetadata = Extract<MessageMetadata, { kind: 'research_final' }>;
+
+function asResearchFinal(
+  metadata: Message['metadata'],
+): ResearchFinalMetadata | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  if ((metadata as { kind?: string }).kind !== 'research_final') return null;
+  return metadata as ResearchFinalMetadata;
+}
+
+function latestFactCheck(
+  iterations: CritiqueIterationRecord[],
+): { iteration: number; results: FactCheckResult[]; budgetExhausted: boolean } | null {
+  for (let i = iterations.length - 1; i >= 0; i -= 1) {
+    const it = iterations[i];
+    if (it.factCheck && it.factCheck.results.length > 0) {
+      return {
+        iteration: it.iteration,
+        results: it.factCheck.results,
+        budgetExhausted: it.factCheck.budgetExhausted,
+      };
+    }
+  }
+  return null;
+}
+
+function factCheckBadgeClasses(status: FactCheckResult['status']): string {
+  switch (status) {
+    case 'verified':
+      return 'bg-green-100 text-green-800';
+    case 'unverified':
+      return 'bg-amber-100 text-amber-800';
+    case 'not_checked':
+      return 'bg-gray-100 text-gray-700';
+  }
+}
+
+function factCheckBadgeLabel(status: FactCheckResult['status']): string {
+  switch (status) {
+    case 'verified':
+      return 'Verified';
+    case 'unverified':
+      return 'Unverified';
+    case 'not_checked':
+      return 'Not checked';
+  }
+}
+
+function ResearchFinalPanel({
+  metadata,
+}: {
+  metadata: ResearchFinalMetadata;
+}) {
+  const factCheck = latestFactCheck(metadata.iterations);
+  const sources: ResearchSource[] = metadata.sources ?? [];
+  if (sources.length === 0 && !factCheck) return null;
+
+  return (
+    <div className="mt-3 space-y-3 border-t border-gray-200 pt-3 text-xs text-gray-700">
+      {factCheck && (
+        <details open className="rounded-md border border-purple-200 bg-purple-50/30 p-2">
+          <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
+            Fact-checked claims (round {factCheck.iteration} — {factCheck.results.length})
+          </summary>
+          <ul className="mt-2 space-y-2">
+            {factCheck.results.map((r, idx) => (
+              <li key={idx} className="rounded bg-white p-2 shadow-sm">
+                <div className="flex items-start gap-2">
+                  <span
+                    className={`inline-block flex-shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${factCheckBadgeClasses(r.status)}`}
+                  >
+                    {factCheckBadgeLabel(r.status)}
+                  </span>
+                  <span className="flex-1 leading-relaxed">{r.claim}</span>
+                </div>
+                {r.supportingUrls.length > 0 && (
+                  <ul className="mt-1 space-y-0.5 pl-2 text-[11px]">
+                    {r.supportingUrls.map((u) => (
+                      <li key={u} className="truncate">
+                        <a
+                          href={u}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {u}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ul>
+          {factCheck.budgetExhausted && (
+            <p className="mt-2 text-[11px] italic text-amber-700">
+              Search budget exhausted — remaining claims could not be verified.
+            </p>
+          )}
+        </details>
+      )}
+      {sources.length > 0 && (
+        <details className="rounded-md border border-gray-200 bg-gray-50 p-2">
+          <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-gray-700">
+            Sources ({sources.length})
+          </summary>
+          <ol className="mt-2 space-y-1 pl-4">
+            {sources.map((s, idx) => (
+              <li key={s.url} className="truncate">
+                <span className="text-gray-500">[{idx + 1}] </span>
+                <a
+                  href={s.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 hover:underline"
+                  title={s.snippet}
+                >
+                  {s.title || s.url}
+                </a>
+              </li>
+            ))}
+          </ol>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function stageLabel(stage: ResearchProgressEvent['stage']): string {
   switch (stage) {
     case 'generating_queries':
@@ -40,6 +172,8 @@ function stageLabel(stage: ResearchProgressEvent['stage']): string {
       return 'Writing first draft...';
     case 'critiquing':
       return 'Critiquing the draft...';
+    case 'fact_checking':
+      return 'Fact-checking claims...';
     case 'revising':
       return 'Revising the draft...';
   }
@@ -1039,6 +1173,8 @@ export default function Home() {
                   activeConversation.messages.map((m) => {
                     const isCurrentlyStreaming = m.id === streamingId;
                     const isEmptyStreaming = isCurrentlyStreaming && m.content.length === 0;
+                    const researchFinal =
+                      m.role === 'assistant' ? asResearchFinal(m.metadata) : null;
                     return (
                       <li
                         key={m.id}
@@ -1064,6 +1200,9 @@ export default function Home() {
                             <MarkdownMessage content={m.content} />
                           ) : (
                             m.content
+                          )}
+                          {researchFinal && (
+                            <ResearchFinalPanel metadata={researchFinal} />
                           )}
                         </div>
                       </li>

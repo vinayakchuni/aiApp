@@ -70,8 +70,15 @@ import {
   weakestCriteria,
   allCriteriaPassed,
   draftSimilarity,
+  parseClaims,
+  factCheckDraft,
+  countVerifiedClaims,
 } from '../services/research';
-import { createSearchService, SearchProviderError } from '../services/search';
+import {
+  createSearchService,
+  SearchBudgetExhaustedError,
+  SearchProviderError,
+} from '../services/search';
 
 const PERFECT_CRITIQUE = `SCORES:
 factual_accuracy: 5
@@ -1108,6 +1115,202 @@ CRITIQUE: x`);
   });
 });
 
+describe('Fact checker helpers', () => {
+  it('parseClaims handles plain lines, dedupes, and caps to max', () => {
+    expect(
+      parseClaims(
+        `EU CAP reform proposed in 2024.
+- Crop yields dropped 12% in 2023.
+"Heat stress livestock 2024"
+EU CAP reform proposed in 2024.`,
+        5,
+      ),
+    ).toEqual([
+      'EU CAP reform proposed in 2024.',
+      'Crop yields dropped 12% in 2023.',
+      'Heat stress livestock 2024',
+    ]);
+  });
+
+  it('parseClaims returns empty for NO_CLAIMS sentinel', () => {
+    expect(parseClaims('NO_CLAIMS', 8)).toEqual([]);
+    expect(parseClaims('  no_claims  ', 8)).toEqual([]);
+    expect(parseClaims('', 8)).toEqual([]);
+  });
+
+  it('parseClaims caps at provided max', () => {
+    const text = Array.from({ length: 12 }, (_, i) => `Claim ${i}`).join('\n');
+    expect(parseClaims(text, 3)).toEqual(['Claim 0', 'Claim 1', 'Claim 2']);
+  });
+
+  it('countVerifiedClaims counts only verified status', () => {
+    expect(
+      countVerifiedClaims({
+        results: [
+          { claim: 'a', status: 'verified', supportingUrls: ['x'] },
+          { claim: 'b', status: 'unverified', supportingUrls: [] },
+          { claim: 'c', status: 'verified', supportingUrls: ['y'] },
+          { claim: 'd', status: 'not_checked', supportingUrls: [] },
+        ],
+        claimsExtracted: 4,
+        searchesUsed: 3,
+        budgetExhausted: false,
+      }),
+    ).toBe(2);
+  });
+});
+
+describe('factCheckDraft', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function fakeSearchWith(impl: {
+    remaining?: number;
+    search?: ReturnType<typeof vi.fn>;
+  }) {
+    let rem = impl.remaining ?? 20;
+    return {
+      remaining: () => rem,
+      search: impl.search ?? vi.fn().mockResolvedValue([]),
+      _consume: () => {
+        rem -= 1;
+      },
+    };
+  }
+
+  it('marks claims with hits as verified and empty results as unverified', async () => {
+    const search = fakeSearchWith({
+      remaining: 10,
+      search: vi
+        .fn()
+        .mockImplementation(async (q: string) => {
+          (search as { _consume: () => void })._consume();
+          if (q.includes('A')) {
+            return [
+              { title: 'A1', url: 'https://a.example/1', snippet: 's1' },
+              { title: 'A2', url: 'https://a.example/2', snippet: 's2' },
+            ];
+          }
+          return [];
+        }),
+    });
+    const generate = vi.fn().mockResolvedValue('Claim A.\nClaim B.');
+
+    const out = await factCheckDraft({
+      draft: 'irrelevant',
+      maxClaims: 8,
+      search: search as never,
+      modelId: 'mock-model',
+      generateFn: generate as never,
+    });
+
+    expect(out.llmCallsAttempted).toBe(1);
+    expect(out.summary.claimsExtracted).toBe(2);
+    expect(out.summary.results).toEqual([
+      {
+        claim: 'Claim A.',
+        status: 'verified',
+        supportingUrls: ['https://a.example/1', 'https://a.example/2'],
+      },
+      { claim: 'Claim B.', status: 'unverified', supportingUrls: [] },
+    ]);
+    expect(out.summary.searchesUsed).toBe(2);
+    expect(out.summary.budgetExhausted).toBe(false);
+  });
+
+  it('returns budgetExhausted=true and skips the LLM call when search is empty', async () => {
+    const search = { remaining: () => 0, search: vi.fn() };
+    const generate = vi.fn();
+
+    const out = await factCheckDraft({
+      draft: 'irrelevant',
+      maxClaims: 8,
+      search: search as never,
+      modelId: 'mock-model',
+      generateFn: generate as never,
+    });
+
+    expect(out.llmCallsAttempted).toBe(0);
+    expect(out.summary.budgetExhausted).toBe(true);
+    expect(out.summary.results).toEqual([]);
+    expect(generate).not.toHaveBeenCalled();
+    expect(search.search).not.toHaveBeenCalled();
+  });
+
+  it('marks remaining claims as not_checked when search budget runs out mid-loop', async () => {
+    let remaining = 1;
+    const search = {
+      remaining: () => remaining,
+      search: vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          remaining = 0;
+          return [{ title: 'A', url: 'https://a.example', snippet: '' }];
+        })
+        .mockImplementation(async () => {
+          throw new SearchBudgetExhaustedError();
+        }),
+    };
+    const generate = vi.fn().mockResolvedValue('Claim 1.\nClaim 2.\nClaim 3.');
+
+    const out = await factCheckDraft({
+      draft: 'irrelevant',
+      maxClaims: 8,
+      search: search as never,
+      modelId: 'mock-model',
+      generateFn: generate as never,
+    });
+
+    expect(out.summary.results.map((r) => r.status)).toEqual([
+      'verified',
+      'not_checked',
+      'not_checked',
+    ]);
+    expect(out.summary.budgetExhausted).toBe(true);
+  });
+
+  it('returns an empty summary and llmCallsAttempted=1 when claim extraction throws', async () => {
+    const search = { remaining: () => 10, search: vi.fn() };
+    const generate = vi.fn().mockRejectedValue(new Error('llm down'));
+
+    const out = await factCheckDraft({
+      draft: 'irrelevant',
+      maxClaims: 8,
+      search: search as never,
+      modelId: 'mock-model',
+      generateFn: generate as never,
+    });
+
+    expect(out.llmCallsAttempted).toBe(1);
+    expect(out.summary.results).toEqual([]);
+    expect(out.summary.claimsExtracted).toBe(0);
+    expect(search.search).not.toHaveBeenCalled();
+  });
+
+  it('treats SearchProviderError as unverified and continues', async () => {
+    const search = {
+      remaining: () => 10,
+      search: vi
+        .fn()
+        .mockRejectedValueOnce(new SearchProviderError('boom', ['firecrawl']))
+        .mockResolvedValueOnce([{ title: 'X', url: 'https://x.example', snippet: '' }]),
+    };
+    const generate = vi.fn().mockResolvedValue('Claim 1.\nClaim 2.');
+
+    const out = await factCheckDraft({
+      draft: 'irrelevant',
+      maxClaims: 8,
+      search: search as never,
+      modelId: 'mock-model',
+      generateFn: generate as never,
+    });
+
+    expect(out.summary.results.map((r) => r.status)).toEqual(['unverified', 'verified']);
+    expect(out.summary.searchesUsed).toBe(2);
+  });
+});
+
 describe('runResearchPipeline critique + revision loop', () => {
   const mockedCreateSearchService = vi.mocked(createSearchService);
 
@@ -1194,7 +1397,7 @@ describe('runResearchPipeline critique + revision loop', () => {
     expect(mockedGenerate).toHaveBeenCalledTimes(3);
   });
 
-  it('runs critique → revise → critique and exits when scores pass', async () => {
+  it('runs critique → fact-check → revise → critique and exits when scores pass', async () => {
     setupConversation();
     setupHistory();
     setupSearch();
@@ -1203,6 +1406,7 @@ describe('runResearchPipeline critique + revision loop', () => {
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Initial draft.')
       .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim one.\nClaim two.')
       .mockResolvedValueOnce('Revised draft with significantly more breadth and depth.')
       .mockResolvedValueOnce(PERFECT_CRITIQUE);
 
@@ -1214,6 +1418,7 @@ describe('runResearchPipeline critique + revision loop', () => {
       expect(out.iterations).toHaveLength(2);
       expect(out.iterations[0].revised).toBe(true);
       expect(out.iterations[0].weakest).toContain('completeness');
+      expect(out.iterations[0].factCheck?.claimsExtracted).toBe(2);
       expect(out.iterations[1].revised).toBe(false);
     }
 
@@ -1233,11 +1438,12 @@ describe('runResearchPipeline critique + revision loop', () => {
     setupHistory();
     setupSearch();
     setupPersistence();
-    // planning + draft + (critique fail + revise) + (critique fail) = 5 calls; 2 iterations capped
+    // planning + draft + (critique fail + fact-check + revise) + (critique fail) = 6 calls; 2 iterations capped
     mockedGenerate
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Draft v1.')
       .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
       .mockResolvedValueOnce('Draft v2 with very different wording entirely throughout.')
       .mockResolvedValueOnce(FAILING_CRITIQUE);
 
@@ -1248,11 +1454,11 @@ describe('runResearchPipeline critique + revision loop', () => {
       expect(out.exitReason).toBe('iterations_exhausted');
       expect(out.iterations).toHaveLength(2);
     }
-    expect(mockedGenerate).toHaveBeenCalledTimes(5);
+    expect(mockedGenerate).toHaveBeenCalledTimes(6);
   });
 
   it('stops with budget_exhausted before exceeding MAX_LLM_CALLS_PER_RESEARCH', async () => {
-    // Budget 4 = planning + draft + 1 critique + 1 revise, no room for next critique
+    // Budget 4 = planning + draft + 1 critique + 1 fact-check; no room for revise
     process.env.MAX_LLM_CALLS_PER_RESEARCH = '4';
     setupConversation();
     setupHistory();
@@ -1262,7 +1468,7 @@ describe('runResearchPipeline critique + revision loop', () => {
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Draft v1.')
       .mockResolvedValueOnce(FAILING_CRITIQUE)
-      .mockResolvedValueOnce('Draft v2 with rewritten content throughout the body.');
+      .mockResolvedValueOnce('Claim A.\nClaim B.');
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
 
@@ -1270,6 +1476,7 @@ describe('runResearchPipeline critique + revision loop', () => {
     if (out.kind === 'ok') {
       expect(out.exitReason).toBe('budget_exhausted');
       expect(out.llmCallsUsed).toBeLessThanOrEqual(4);
+      expect(out.iterations[0].revised).toBe(false);
     }
     expect(mockedGenerate).toHaveBeenCalledTimes(4);
   });
@@ -1284,6 +1491,7 @@ describe('runResearchPipeline critique + revision loop', () => {
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce(draft)
       .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
       .mockResolvedValueOnce(draft); // identical revision → similarity 1
 
     const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
@@ -1296,7 +1504,7 @@ describe('runResearchPipeline critique + revision loop', () => {
     }
   });
 
-  it('emits critiquing and revising progress events with iteration numbers', async () => {
+  it('emits critiquing, fact_checking, and revising progress events with iteration numbers', async () => {
     setupConversation();
     setupHistory();
     setupSearch();
@@ -1305,10 +1513,17 @@ describe('runResearchPipeline critique + revision loop', () => {
       .mockResolvedValueOnce('q1\nq2')
       .mockResolvedValueOnce('Draft v1.')
       .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
       .mockResolvedValueOnce('Draft v2 with broader scope and richer sourcing.')
       .mockResolvedValueOnce(PERFECT_CRITIQUE);
 
-    const events: { stage: string; iteration?: number; weakestCriteria?: string[] }[] = [];
+    const events: {
+      stage: string;
+      iteration?: number;
+      weakestCriteria?: string[];
+      claimsExtracted?: number;
+      claimsVerified?: number;
+    }[] = [];
     await runResearchPipeline({
       userId: USER_ID,
       conversationId: 'conv-1',
@@ -1316,9 +1531,14 @@ describe('runResearchPipeline critique + revision loop', () => {
     });
 
     const critique1 = events.find((e) => e.stage === 'critiquing' && e.iteration === 1);
+    const factCheck1 = events.filter(
+      (e) => e.stage === 'fact_checking' && e.iteration === 1,
+    );
     const revising1 = events.find((e) => e.stage === 'revising' && e.iteration === 1);
     const critique2 = events.find((e) => e.stage === 'critiquing' && e.iteration === 2);
     expect(critique1).toBeDefined();
+    expect(factCheck1.length).toBeGreaterThanOrEqual(2); // start + summary
+    expect(factCheck1[factCheck1.length - 1].claimsExtracted).toBe(2);
     expect(revising1).toBeDefined();
     expect(revising1!.weakestCriteria).toContain('completeness');
     expect(critique2).toBeDefined();
@@ -1361,6 +1581,111 @@ describe('runResearchPipeline critique + revision loop', () => {
       data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
     });
     expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+  });
+
+  it('stores fact-check results in iteration metadata and revise prompt sees them', async () => {
+    setupConversation();
+    setupHistory();
+    // Track only initial-search queries; fact-check uses a different search() pattern
+    let factCheckSearches = 0;
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockImplementation(async (q: string) => {
+        if (q.startsWith('q')) {
+          // initial query searches
+          return [
+            { title: 'A', url: 'https://a.example', snippet: 'sa' },
+            { title: 'B', url: 'https://b.example', snippet: 'sb' },
+            { title: 'C', url: 'https://c.example', snippet: 'sc' },
+          ];
+        }
+        // claim verification searches
+        factCheckSearches += 1;
+        if (factCheckSearches === 1) {
+          return [{ title: 'V', url: 'https://v.example', snippet: '' }];
+        }
+        return [];
+      }),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    setupPersistence();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('First claim.\nSecond claim.')
+      .mockResolvedValueOnce('Revised draft addressing the critique and fact-check.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.iterations[0].factCheck).toBeDefined();
+      expect(out.iterations[0].factCheck!.results).toHaveLength(2);
+      expect(out.iterations[0].factCheck!.results[0].status).toBe('verified');
+      expect(out.iterations[0].factCheck!.results[1].status).toBe('unverified');
+    }
+
+    // The revise prompt (5th call: planning, draft, critique, claim-extract, revise) sees fact-check
+    const revisePrompt = (mockedGenerate.mock.calls[4][0] as Array<{ content: string }>)
+      .map((m) => m.content)
+      .join('\n');
+    expect(revisePrompt).toContain('FACT-CHECK RESULTS:');
+    expect(revisePrompt).toContain('[VERIFIED] First claim.');
+    expect(revisePrompt).toContain('[UNVERIFIED] Second claim.');
+
+    // Final metadata persists fact-check on the iteration
+    const final = mockedPrisma.message.create.mock.calls[0][0] as {
+      data: {
+        metadata: {
+          iterations: Array<{ factCheck?: { results: Array<{ status: string }> } }>;
+        };
+      };
+    };
+    expect(final.data.metadata.iterations[0].factCheck).toBeDefined();
+    expect(final.data.metadata.iterations[0].factCheck!.results).toHaveLength(2);
+  });
+
+  it('skips fact-check entirely when search budget is exhausted', async () => {
+    setupConversation();
+    setupHistory();
+    setupPersistence();
+    let rem = 2;
+    const fakeSearch = {
+      remaining: vi.fn().mockImplementation(() => rem),
+      search: vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          rem -= 1;
+          return [{ title: 'A', url: 'https://a.example', snippet: 'sa' }];
+        })
+        .mockImplementationOnce(async () => {
+          rem = 0;
+          return [
+            { title: 'B', url: 'https://b.example', snippet: 'sb' },
+            { title: 'C', url: 'https://c.example', snippet: 'sc' },
+          ];
+        }),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Revised draft directly addressing the critique.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      expect(out.iterations[0].factCheck).toBeUndefined();
+      expect(out.iterations[0].revised).toBe(true);
+    }
+    // 5 calls: planning, draft, critique, revise, critique. NO claim extraction.
+    expect(mockedGenerate).toHaveBeenCalledTimes(5);
   });
 });
 
