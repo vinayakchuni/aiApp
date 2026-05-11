@@ -38,12 +38,34 @@ vi.mock('../services/ai', () => ({
   generateAssistantText: vi.fn(),
 }));
 
+vi.mock('../services/search', () => ({
+  createSearchService: vi.fn(),
+  getMaxSearchesPerResearch: vi.fn(() => 20),
+  SearchBudgetExhaustedError: class extends Error {
+    constructor() {
+      super('budget');
+      this.name = 'SearchBudgetExhaustedError';
+    }
+  },
+  SearchProviderError: class extends Error {
+    public readonly providersTried: readonly string[];
+    constructor(message: string, providersTried: readonly string[] = []) {
+      super(message);
+      this.name = 'SearchProviderError';
+      this.providersTried = providersTried;
+    }
+  },
+}));
+
 import { prisma } from '../lib/db';
 import { generateAssistantText } from '../services/ai';
 import {
   parseClarifyingQuestions,
   parseProcessAnswerResponse,
+  parseSearchQueries,
+  runResearchPipeline,
 } from '../services/research';
+import { createSearchService, SearchProviderError } from '../services/search';
 
 const mockedPrisma = vi.mocked(prisma);
 const mockedGenerate = vi.mocked(generateAssistantText);
@@ -572,3 +594,410 @@ describe('Clarifying answer flow via POST /messages', () => {
     expect(mockedPrisma.message.create).not.toHaveBeenCalled();
   });
 });
+
+describe('parseSearchQueries', () => {
+  it('parses one-per-line plain text', () => {
+    expect(
+      parseSearchQueries(`climate impacts agriculture
+EU crop yields 2024
+heat stress livestock`),
+    ).toEqual([
+      'climate impacts agriculture',
+      'EU crop yields 2024',
+      'heat stress livestock',
+    ]);
+  });
+
+  it('strips numbering and quotes', () => {
+    expect(
+      parseSearchQueries(`1. "EU climate policy"
+2) 'heat stress livestock'
+- climate impacts agriculture`),
+    ).toEqual(['EU climate policy', 'heat stress livestock', 'climate impacts agriculture']);
+  });
+
+  it('caps at 5 queries', () => {
+    const text = Array.from({ length: 9 }, (_, i) => `q${i}`).join('\n');
+    expect(parseSearchQueries(text)).toHaveLength(5);
+  });
+});
+
+describe('runResearchPipeline', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function setupConversation(opts: {
+    mode?: 'chat' | 'research';
+    status?: string;
+    userId?: string;
+  } = {}) {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: opts.userId ?? USER_ID,
+      mode: opts.mode ?? 'research',
+      researchStatus: opts.status ?? 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+  }
+
+  function setupHistory() {
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Climate impacts on agriculture', metadata: null },
+      {
+        role: 'assistant',
+        content: '1. Region?\n2. Time horizon?',
+        metadata: { kind: 'clarifying_questions', questions: ['Region?', 'Time horizon?'] },
+      },
+      { role: 'user', content: 'EU only, next 5 years', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: focus on EU agricultural impacts through 2030.',
+        metadata: { kind: 'research_ready', summary: 'focus on EU through 2030' },
+      },
+    ] as never);
+  }
+
+  it('returns not-found for the wrong user', async () => {
+    setupConversation({ userId: OTHER_USER_ID });
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out).toEqual({ kind: 'not-found' });
+  });
+
+  it('returns wrong-status when status is not researching', async () => {
+    setupConversation({ status: 'clarifying' });
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out).toEqual({ kind: 'wrong-status' });
+  });
+
+  it('runs the happy path: plans queries, gathers sources, writes draft, marks complete', async () => {
+    setupConversation();
+    setupHistory();
+
+    mockedGenerate
+      .mockResolvedValueOnce('eu agriculture climate impacts\nheat stress crops eu')
+      .mockResolvedValueOnce('Draft body with citations [1] [2] [3].');
+
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi
+        .fn()
+        .mockResolvedValueOnce([
+          { title: 'A', url: 'https://a.example', snippet: 'sa' },
+          { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        ])
+        .mockResolvedValueOnce([
+          { title: 'B-dup', url: 'https://b.example', snippet: 'sb2' },
+          { title: 'C', url: 'https://c.example', snippet: 'sc' },
+        ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-draft',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'Draft body with citations [1] [2] [3].',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'New conversation',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+
+    const progressEvents: { stage: string; detail?: string }[] = [];
+    const out = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+      onProgress: (p) => progressEvents.push(p),
+    });
+
+    expect(out.kind).toBe('ok');
+    if (out.kind === 'ok') {
+      // De-duplicated by URL
+      expect(out.sources.map((s) => s.url)).toEqual([
+        'https://a.example',
+        'https://b.example',
+        'https://c.example',
+      ]);
+      expect(out.queries).toEqual([
+        'eu agriculture climate impacts',
+        'heat stress crops eu',
+      ]);
+    }
+
+    // Persisted with metadata
+    const draftCreate = mockedPrisma.message.create.mock.calls[0][0] as {
+      data: { metadata: { kind: string; queries: string[]; sources: unknown[] } };
+    };
+    expect(draftCreate.data.metadata.kind).toBe('research_draft');
+    expect(draftCreate.data.metadata.queries).toEqual([
+      'eu agriculture climate impacts',
+      'heat stress crops eu',
+    ]);
+    expect(draftCreate.data.metadata.sources).toHaveLength(3);
+
+    expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { researchStatus: 'complete', updatedAt: expect.any(Date) },
+    });
+
+    // Progress events covered all stages in order
+    const stages = progressEvents.map((p) => p.stage);
+    expect(stages).toEqual([
+      'generating_queries',
+      'searching',
+      'searching',
+      'analyzing_sources',
+      'writing_draft',
+    ]);
+  });
+
+  it('returns insufficient-sources and marks failed when <3 unique sources gathered', async () => {
+    setupConversation();
+    setupHistory();
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi
+        .fn()
+        .mockResolvedValueOnce([
+          { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        ])
+        .mockResolvedValueOnce([
+          { title: 'A-dup', url: 'https://a.example', snippet: 'sa' },
+          { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+
+    expect(out).toEqual({ kind: 'insufficient-sources', sourcesFound: 2 });
+    expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
+    });
+    // Draft not persisted
+    expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+    // Draft LLM call NOT made
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns search-failed when every query errors at the provider layer', async () => {
+    setupConversation();
+    setupHistory();
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi
+        .fn()
+        .mockRejectedValue(new SearchProviderError('boom', ['firecrawl', 'brave'])),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('search-failed');
+    expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
+    });
+  });
+
+  it('returns ai-error when query planning throws', async () => {
+    setupConversation();
+    setupHistory();
+    mockedGenerate.mockRejectedValueOnce(new Error('llm down'));
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ai-error');
+    expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
+    });
+  });
+
+  it('returns ai-error when draft generation throws (after gathering sources)', async () => {
+    setupConversation();
+    setupHistory();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2\nq3')
+      .mockRejectedValueOnce(new Error('llm draft fail'));
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ai-error');
+    expect(mockedPrisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { researchStatus: 'failed', updatedAt: expect.any(Date) },
+    });
+    expect(mockedPrisma.message.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/conversations/:id/research/run (SSE)', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('requires auth', async () => {
+    const res = await request(app)
+      .post('/api/conversations/conv-1/research/run')
+      .send({});
+    expect(res.status).toBe(401);
+  });
+
+  it('streams progress + complete events on the happy path', async () => {
+    authedSession();
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: scope',
+        metadata: { kind: 'research_ready', summary: 'scope' },
+      },
+    ] as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2').mockResolvedValueOnce('Draft body.');
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-draft',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'Draft body.',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+
+    const res = await request(app)
+      .post('/api/conversations/conv-1/research/run')
+      .set('Cookie', 'session_id=session-1')
+      .send({});
+
+    expect(res.status).toBe(200);
+    const events = parseSseEvents(res.text);
+    const types = events.map((e) => e.event);
+    expect(types).toContain('research-progress');
+    expect(types[types.length - 1]).toBe('research-complete');
+    const complete = events[events.length - 1].data as {
+      conversation: { researchStatus: string };
+      assistantMessage: { id: string };
+    };
+    expect(complete.conversation.researchStatus).toBe('complete');
+    expect(complete.assistantMessage.id).toBe('m-draft');
+  });
+
+  it('emits research-failed when status is not researching', async () => {
+    authedSession();
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'clarifying',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+
+    const res = await request(app)
+      .post('/api/conversations/conv-1/research/run')
+      .set('Cookie', 'session_id=session-1')
+      .send({});
+
+    expect(res.status).toBe(200);
+    const events = parseSseEvents(res.text);
+    const failed = events.find((e) => e.event === 'research-failed');
+    expect(failed).toBeDefined();
+    expect((failed!.data as { code: string }).code).toBe('WRONG_STATUS');
+  });
+
+  it('emits research-failed with INSUFFICIENT_SOURCES when too few sources gathered', async () => {
+    authedSession();
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic', metadata: null },
+    ] as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+    const fakeSearch = {
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+      ]),
+    };
+    mockedCreateSearchService.mockReturnValue(fakeSearch as never);
+    mockedPrisma.conversation.update.mockResolvedValue({} as never);
+
+    const res = await request(app)
+      .post('/api/conversations/conv-1/research/run')
+      .set('Cookie', 'session_id=session-1')
+      .send({});
+
+    const events = parseSseEvents(res.text);
+    const failed = events.find((e) => e.event === 'research-failed');
+    expect(failed).toBeDefined();
+    expect((failed!.data as { code: string }).code).toBe('INSUFFICIENT_SOURCES');
+  });
+});
+
+function parseSseEvents(body: string) {
+  const events: { event: string; data: unknown }[] = [];
+  for (const block of body.split('\n\n')) {
+    if (!block.trim()) continue;
+    let event = 'message';
+    const dataLines: string[] = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (dataLines.length === 0) continue;
+    events.push({ event, data: JSON.parse(dataLines.join('\n')) });
+  }
+  return events;
+}

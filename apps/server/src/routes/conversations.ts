@@ -21,7 +21,11 @@ import {
   listFilesForConversation,
   getMaxFileSizeBytes,
 } from '../services/files';
-import { startResearch, processClarifyingAnswer } from '../services/research';
+import {
+  startResearch,
+  processClarifyingAnswer,
+  runResearchPipeline,
+} from '../services/research';
 import { prisma } from '../lib/db';
 import type { ConversationMode } from '../generated/prisma/enums';
 
@@ -314,6 +318,77 @@ conversationsRouter.post(
         });
         return;
     }
+  },
+);
+
+conversationsRouter.post(
+  '/:id/research/run',
+  csrfProtection,
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const id = String(req.params.id);
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const abortController = new AbortController();
+    const onClose = () => abortController.abort();
+    req.on('close', onClose);
+
+    const outcome = await runResearchPipeline({
+      userId: req.user!.id,
+      conversationId: id,
+      abortSignal: abortController.signal,
+      onProgress: (p) => writeSseEvent(res, 'research-progress', p),
+    });
+
+    req.off('close', onClose);
+
+    switch (outcome.kind) {
+      case 'ok':
+        writeSseEvent(res, 'research-complete', {
+          conversation: outcome.conversation,
+          assistantMessage: outcome.assistantMessage,
+        });
+        break;
+      case 'not-found':
+        writeSseEvent(res, 'research-failed', {
+          code: 'NOT_FOUND',
+          message: 'Conversation not found.',
+        });
+        break;
+      case 'wrong-status':
+        writeSseEvent(res, 'research-failed', {
+          code: 'WRONG_STATUS',
+          message: 'Research is not ready to run on this conversation.',
+        });
+        break;
+      case 'insufficient-sources':
+        writeSseEvent(res, 'research-failed', {
+          code: 'INSUFFICIENT_SOURCES',
+          message: `Only ${outcome.sourcesFound} source(s) gathered. Please rephrase the topic and try again.`,
+          sourcesFound: outcome.sourcesFound,
+        });
+        break;
+      case 'search-failed':
+        writeSseEvent(res, 'research-failed', {
+          code: 'SEARCH_FAILED',
+          message: outcome.message,
+        });
+        break;
+      case 'ai-error':
+        writeSseEvent(res, 'research-failed', {
+          code: 'AI_ERROR',
+          message: outcome.message,
+        });
+        break;
+      case 'aborted':
+        // Client disconnected — no point writing further events.
+        break;
+    }
+    res.end();
   },
 );
 

@@ -7,6 +7,9 @@ import type {
   ConversationMode,
   ConversationWithMessages,
   Message,
+  ResearchCompleteEvent,
+  ResearchFailedEvent,
+  ResearchProgressEvent,
   UserResponse,
   UserSettingsResponse,
 } from '@ai-app/shared';
@@ -24,6 +27,19 @@ interface Toast {
 }
 
 let toastCounter = 0;
+
+function stageLabel(stage: ResearchProgressEvent['stage']): string {
+  switch (stage) {
+    case 'generating_queries':
+      return 'Planning searches...';
+    case 'searching':
+      return 'Searching the web...';
+    case 'analyzing_sources':
+      return 'Analyzing sources...';
+    case 'writing_draft':
+      return 'Writing first draft...';
+  }
+}
 
 export default function Home() {
   const [user, setUser] = useState<UserResponse | null>(null);
@@ -44,7 +60,9 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [conversationFull, setConversationFull] = useState(false);
+  const [researchProgress, setResearchProgress] = useState<ResearchProgressEvent | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const researchAbortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const userScrolledUpRef = useRef(false);
@@ -251,6 +269,128 @@ export default function Home() {
     }
   }
 
+  async function runResearchPipeline(conversationId: string) {
+    if (researchAbortRef.current) return;
+    const abortController = new AbortController();
+    researchAbortRef.current = abortController;
+    setResearchProgress({ stage: 'generating_queries', detail: 'Planning searches' });
+
+    const placeholderId = `research-placeholder-${Date.now()}`;
+    const placeholder: Message = {
+      id: placeholderId,
+      conversationId,
+      role: 'assistant',
+      content: '',
+      createdAt: new Date().toISOString(),
+    };
+    setActiveConversation((prev) =>
+      prev && prev.id === conversationId
+        ? { ...prev, messages: [...prev.messages, placeholder] }
+        : prev,
+    );
+
+    const removePlaceholder = () =>
+      setActiveConversation((prev) =>
+        prev && prev.id === conversationId
+          ? { ...prev, messages: prev.messages.filter((m) => m.id !== placeholderId) }
+          : prev,
+      );
+
+    try {
+      const res = await apiPost(
+        `/api/conversations/${conversationId}/research/run`,
+        undefined,
+        abortController.signal,
+      );
+
+      if (!res.ok) {
+        removePlaceholder();
+        addToast('Could not start research. Please try again.');
+        setResearchProgress(null);
+        return;
+      }
+
+      let assistantMessage: Message | null = null;
+      let updatedConversation: Conversation | null = null;
+      let receivedFailure = false;
+
+      for await (const evt of readSseEvents(res)) {
+        if (evt.event === 'research-progress') {
+          setResearchProgress(evt.data as ResearchProgressEvent);
+        } else if (evt.event === 'research-complete') {
+          const payload = evt.data as ResearchCompleteEvent;
+          assistantMessage = payload.assistantMessage;
+          updatedConversation = payload.conversation;
+        } else if (evt.event === 'research-failed') {
+          receivedFailure = true;
+          const payload = evt.data as ResearchFailedEvent;
+          addToast(payload.message || 'Research failed.');
+        }
+      }
+
+      if (assistantMessage && !receivedFailure) {
+        const finalAssistant = assistantMessage;
+        setActiveConversation((prev) =>
+          prev && prev.id === conversationId
+            ? {
+                ...prev,
+                ...(updatedConversation
+                  ? {
+                      mode: updatedConversation.mode,
+                      researchStatus: updatedConversation.researchStatus,
+                    }
+                  : {}),
+                messages: prev.messages.map((m) =>
+                  m.id === placeholderId ? finalAssistant : m,
+                ),
+              }
+            : prev,
+        );
+        if (updatedConversation) {
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === conversationId
+                ? {
+                    ...c,
+                    mode: updatedConversation!.mode,
+                    researchStatus: updatedConversation!.researchStatus,
+                    updatedAt: new Date().toISOString(),
+                  }
+                : c,
+            ),
+          );
+        }
+      } else {
+        removePlaceholder();
+        if (!receivedFailure) {
+          addToast('Research ended unexpectedly. Please try again.');
+        }
+        // Refresh conversation so status reflects server-side 'failed'
+        try {
+          const refreshed = await apiGet(`/api/conversations/${conversationId}`)
+            .then((r) => r.json())
+            .catch(() => null);
+          if (refreshed?.success) {
+            setActiveConversation(refreshed.conversation as ConversationWithMessages);
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        removePlaceholder();
+      } else {
+        console.error(err);
+        removePlaceholder();
+        addToast('Network error during research. Please try again.');
+      }
+    } finally {
+      researchAbortRef.current = null;
+      setResearchProgress(null);
+    }
+  }
+
   async function handleSendClarifyingAnswer(content: string) {
     if (!activeId) return;
     const optimisticId = `optimistic-user-${Date.now()}`;
@@ -282,6 +422,7 @@ export default function Home() {
       const userMessage = data.userMessage as Message;
       const assistantMessage = data.assistantMessage as Message;
       const updatedConv = data.conversation as Conversation | undefined;
+      const conversationId = activeId;
       setActiveConversation((prev) =>
         prev
           ? {
@@ -297,6 +438,9 @@ export default function Home() {
             }
           : prev,
       );
+      if (data.kind === 'ready' && conversationId) {
+        void runResearchPipeline(conversationId);
+      }
     } catch (err) {
       console.error(err);
       setActiveConversation((prev) =>
@@ -915,6 +1059,25 @@ export default function Home() {
               </div>
             )}
 
+            {/* Research progress banner */}
+            {researchProgress && (
+              <div className="border-t border-purple-200 bg-purple-50 px-4 py-3 md:px-6">
+                <div className="mx-auto flex max-w-3xl items-center gap-3 text-sm text-purple-800">
+                  <span
+                    aria-label="Research in progress"
+                    className="inline-flex gap-1"
+                  >
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-400 [animation-delay:-0.3s]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-400 [animation-delay:-0.15s]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-400" />
+                  </span>
+                  <span className="flex-1">
+                    {researchProgress.detail ?? stageLabel(researchProgress.stage)}
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* Conversation full banner */}
             {conversationFull && (
               <div className="border-t border-amber-200 bg-amber-50 px-4 py-3 text-center md:px-6">
@@ -990,20 +1153,27 @@ export default function Home() {
                     placeholder={
                       conversationFull
                         ? 'Message limit reached'
-                        : activeConversation.mode === 'research' &&
-                            activeConversation.researchStatus === 'idle'
-                          ? 'Enter your research topic...'
+                        : researchProgress
+                          ? 'Researching...'
                           : activeConversation.mode === 'research' &&
-                              activeConversation.researchStatus === 'clarifying'
-                            ? 'Answer the clarifying questions...'
-                            : 'Type a message...'
+                              activeConversation.researchStatus === 'idle'
+                            ? 'Enter your research topic...'
+                            : activeConversation.mode === 'research' &&
+                                activeConversation.researchStatus === 'clarifying'
+                              ? 'Answer the clarifying questions...'
+                              : 'Type a message...'
                     }
-                    disabled={isSending || conversationFull}
+                    disabled={isSending || conversationFull || researchProgress !== null}
                     className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
                   />
                   <button
                     type="submit"
-                    disabled={isSending || draft.trim().length === 0 || conversationFull}
+                    disabled={
+                      isSending ||
+                      draft.trim().length === 0 ||
+                      conversationFull ||
+                      researchProgress !== null
+                    }
                     className="rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {isSending ? 'Sending...' : 'Send'}

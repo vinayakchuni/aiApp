@@ -13,10 +13,46 @@ export type ResearchStatus =
   | 'complete'
   | 'failed';
 
+export interface ResearchSource {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
 export type MessageMetadata =
   | { kind: 'clarifying_questions'; questions: string[] }
   | { kind: 'research_ready'; summary?: string }
+  | { kind: 'research_draft'; queries: string[]; sources: ResearchSource[] }
   | { kind: string; [key: string]: unknown };
+
+export type ResearchProgressStage =
+  | 'generating_queries'
+  | 'searching'
+  | 'analyzing_sources'
+  | 'writing_draft';
+
+export interface ResearchProgressEvent {
+  stage: ResearchProgressStage;
+  detail?: string;
+  query?: string;
+  sourcesFound?: number;
+}
+
+export interface ResearchCompleteEvent {
+  conversation: Conversation;
+  assistantMessage: Message;
+}
+
+export interface ResearchFailedEvent {
+  code:
+    | 'NOT_FOUND'
+    | 'WRONG_STATUS'
+    | 'INSUFFICIENT_SOURCES'
+    | 'SEARCH_FAILED'
+    | 'AI_ERROR';
+  message: string;
+  sourcesFound?: number;
+}
 
 export interface Message {
   id: string;
