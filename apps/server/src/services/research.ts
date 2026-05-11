@@ -11,6 +11,7 @@ import {
   type SearchResult,
   type SearchService,
 } from './search';
+import { createResearchTrace } from './tracing';
 
 const activeResearchUsers = new Set<string>();
 
@@ -1190,7 +1191,33 @@ async function runResearchPipelineImpl(
   let llmCallsUsed = 0;
   const llmCallsRemaining = () => maxLlmCalls - llmCallsUsed;
 
+  const trace = createResearchTrace({
+    userId,
+    conversationId,
+    topic,
+    modelId,
+    clarifyingAnswers,
+    scopeSummary: summary,
+  });
+  let traceFinalize: {
+    output?: unknown;
+    metadata?: Record<string, unknown>;
+    exitReason?: string;
+    error?: string;
+  } = {};
+
+  try {
+    return await runPipelineBody();
+  } finally {
+    await trace.finish(traceFinalize);
+  }
+
+  async function runPipelineBody(): Promise<RunResearchOutcome> {
   onProgress?.({ stage: 'generating_queries', detail: 'Planning searches' });
+
+  const searchSpan = trace.startSpan('searching', {
+    metadata: { stage: 'searching' },
+  });
 
   const planningMessages: LLMMessage[] = [
     { role: 'system', content: SEARCH_QUERY_GEN_PROMPT },
@@ -1210,6 +1237,12 @@ async function runResearchPipelineImpl(
     queriesText = await generateAssistantText(planningMessages, modelId);
   } catch (err) {
     console.error('Search-query planning failed:', err);
+    searchSpan.end({
+      level: 'ERROR',
+      statusMessage: 'planning LLM failed',
+      metadata: { error: String(err) },
+    });
+    traceFinalize = { error: 'planning LLM failed', exitReason: 'ai_error' };
     await markFailed(
       conversationId,
       'Research could not start because the AI provider failed while planning searches. Please try again.',
@@ -1217,7 +1250,11 @@ async function runResearchPipelineImpl(
     return { kind: 'ai-error', message: 'Could not plan searches.' };
   }
 
-  if (abortSignal?.aborted) return { kind: 'aborted' };
+  if (abortSignal?.aborted) {
+    searchSpan.end({ level: 'WARNING', statusMessage: 'aborted' });
+    traceFinalize = { exitReason: 'aborted' };
+    return { kind: 'aborted' };
+  }
 
   const queries = parseSearchQueries(queriesText);
   const requestedFiles = matchRequestedFiles(
@@ -1225,6 +1262,12 @@ async function runResearchPipelineImpl(
     researchFiles,
   );
   if (queries.length === 0) {
+    searchSpan.end({
+      level: 'ERROR',
+      statusMessage: 'no queries produced',
+      metadata: { queriesText },
+    });
+    traceFinalize = { error: 'no queries produced', exitReason: 'ai_error' };
     await markFailed(
       conversationId,
       'Research could not start because the AI provider did not return any search queries. Please rephrase the topic and try again.',
@@ -1238,7 +1281,11 @@ async function runResearchPipelineImpl(
   let providerErrors = 0;
 
   for (const query of queries) {
-    if (abortSignal?.aborted) return { kind: 'aborted' };
+    if (abortSignal?.aborted) {
+      searchSpan.end({ level: 'WARNING', statusMessage: 'aborted' });
+      traceFinalize = { exitReason: 'aborted' };
+      return { kind: 'aborted' };
+    }
     onProgress?.({
       stage: 'searching',
       detail: `Searching for: ${query}`,
@@ -1266,6 +1313,15 @@ async function runResearchPipelineImpl(
 
   if (sources.length < MIN_SOURCES_REQUIRED) {
     if (providerErrors >= queries.length) {
+      searchSpan.end({
+        level: 'ERROR',
+        statusMessage: 'all search providers failed',
+        metadata: { queries, providerErrors, sourcesFound: sources.length },
+      });
+      traceFinalize = {
+        error: 'all search providers failed',
+        exitReason: 'search_failed',
+      };
       await markFailed(
         conversationId,
         'Research failed: every web search provider returned an error. Please try again later.',
@@ -1275,6 +1331,15 @@ async function runResearchPipelineImpl(
         message: 'All web search providers failed. Please try again later.',
       };
     }
+    searchSpan.end({
+      level: 'ERROR',
+      statusMessage: 'insufficient sources',
+      metadata: { queries, providerErrors, sourcesFound: sources.length },
+    });
+    traceFinalize = {
+      error: 'insufficient sources',
+      exitReason: 'insufficient_sources',
+    };
     await markFailed(
       conversationId,
       `Research could not produce a draft because only ${sources.length} source(s) were gathered. Please rephrase the topic and try again.`,
@@ -1282,16 +1347,30 @@ async function runResearchPipelineImpl(
     return { kind: 'insufficient-sources', sourcesFound: sources.length };
   }
 
+  searchSpan.end({
+    metadata: {
+      queries,
+      sourcesFound: sources.length,
+      providerErrors,
+      minSourceThreshold: MIN_SOURCES_REQUIRED,
+    },
+    output: { sources },
+  });
+
   onProgress?.({
     stage: 'analyzing_sources',
     detail: `Analyzing ${sources.length} sources`,
     sourcesFound: sources.length,
   });
 
-  if (abortSignal?.aborted) return { kind: 'aborted' };
+  if (abortSignal?.aborted) {
+    traceFinalize = { exitReason: 'aborted' };
+    return { kind: 'aborted' };
+  }
 
   onProgress?.({ stage: 'writing_draft', detail: 'Writing first draft' });
 
+  const draftingSpan = trace.startSpan('drafting');
   let currentDraft: string;
   try {
     llmCallsUsed += 1;
@@ -1313,12 +1392,21 @@ async function runResearchPipelineImpl(
     );
   } catch (err) {
     console.error('Draft generation failed:', err);
+    draftingSpan.end({
+      level: 'ERROR',
+      statusMessage: 'draft LLM failed',
+      metadata: { error: String(err) },
+    });
+    traceFinalize = { error: 'draft LLM failed', exitReason: 'ai_error' };
     await markFailed(
       conversationId,
       'Research failed: the AI provider could not write the first draft. Please try again.',
     );
     return { kind: 'ai-error', message: 'Could not write the draft.' };
   }
+  draftingSpan.end({
+    metadata: { draftLength: currentDraft.length, sourcesUsed: sources.length },
+  });
 
   const documentsUsed = researchFiles.map((f) => ({
     id: f.id,
@@ -1332,7 +1420,10 @@ async function runResearchPipelineImpl(
   let exitReason: ResearchExitReason = 'iterations_exhausted';
 
   for (let i = 1; i <= maxIterations; i += 1) {
-    if (abortSignal?.aborted) return { kind: 'aborted' };
+    if (abortSignal?.aborted) {
+      traceFinalize = { exitReason: 'aborted' };
+      return { kind: 'aborted' };
+    }
 
     if (llmCallsRemaining() < 1) {
       exitReason = 'budget_exhausted';
@@ -1346,6 +1437,9 @@ async function runResearchPipelineImpl(
       maxIterations,
     });
 
+    const critiqueSpan = trace.startSpan('critiquing', {
+      metadata: { iteration: i, maxIterations },
+    });
     let critiqueText: string;
     try {
       llmCallsUsed += 1;
@@ -1367,6 +1461,12 @@ async function runResearchPipelineImpl(
       );
     } catch (err) {
       console.error(`Critique generation failed at iteration ${i}:`, err);
+      critiqueSpan.end({
+        level: 'ERROR',
+        statusMessage: 'critique LLM failed',
+        metadata: { iteration: i, error: String(err) },
+      });
+      traceFinalize = { error: 'critique LLM failed', exitReason: 'ai_error' };
       await markFailed(
         conversationId,
         'Research failed: the AI provider could not critique the draft. Please try again.',
@@ -1377,6 +1477,11 @@ async function runResearchPipelineImpl(
     const parsed = parseCritique(critiqueText);
     if (!parsed) {
       console.error(`Critique parse failed at iteration ${i}: ${critiqueText}`);
+      critiqueSpan.end({
+        level: 'ERROR',
+        statusMessage: 'critique parse failed',
+        metadata: { iteration: i },
+      });
       exitReason = 'critique_parse_failed';
       break;
     }
@@ -1391,6 +1496,10 @@ async function runResearchPipelineImpl(
     };
     iterations.push(record);
     finalScores = parsed.scores;
+    critiqueSpan.end({
+      metadata: { iteration: i, scores: parsed.scores, weakest },
+      output: { scores: parsed.scores, critique: parsed.critique },
+    });
 
     if (allCriteriaPassed(parsed.scores)) {
       exitReason = 'all_passed';
@@ -1407,7 +1516,10 @@ async function runResearchPipelineImpl(
       break;
     }
 
-    if (abortSignal?.aborted) return { kind: 'aborted' };
+    if (abortSignal?.aborted) {
+      traceFinalize = { exitReason: 'aborted' };
+      return { kind: 'aborted' };
+    }
 
     let factCheckSummary: FactCheckSummary | undefined;
     if (search.remaining() > 0) {
@@ -1416,6 +1528,9 @@ async function runResearchPipelineImpl(
         detail: `Fact-check round ${i} — extracting claims`,
         iteration: i,
         maxIterations,
+      });
+      const factCheckSpan = trace.startSpan('fact-checking', {
+        metadata: { iteration: i },
       });
       const fc = await factCheckDraft({
         draft: currentDraft,
@@ -1437,9 +1552,26 @@ async function runResearchPipelineImpl(
           claimsExtracted: fc.summary.claimsExtracted,
           claimsVerified: verified,
         });
+        factCheckSpan.end({
+          metadata: {
+            iteration: i,
+            claimsExtracted: fc.summary.claimsExtracted,
+            claimsVerified: verified,
+            searchesUsed: fc.summary.searchesUsed,
+            budgetExhausted: fc.summary.budgetExhausted,
+          },
+          output: { results: fc.summary.results },
+        });
+      } else {
+        factCheckSpan.end({
+          metadata: { iteration: i, skipped: true, reason: 'no LLM call made' },
+        });
       }
 
-      if (abortSignal?.aborted) return { kind: 'aborted' };
+      if (abortSignal?.aborted) {
+        traceFinalize = { exitReason: 'aborted' };
+        return { kind: 'aborted' };
+      }
 
       if (llmCallsRemaining() < 1) {
         exitReason = 'budget_exhausted';
@@ -1458,6 +1590,9 @@ async function runResearchPipelineImpl(
       scores: parsed.scores,
     });
 
+    const reviseSpan = trace.startSpan('revising', {
+      metadata: { iteration: i, weakest },
+    });
     let revisedDraft: string;
     try {
       llmCallsUsed += 1;
@@ -1483,6 +1618,12 @@ async function runResearchPipelineImpl(
       );
     } catch (err) {
       console.error(`Revision generation failed at iteration ${i}:`, err);
+      reviseSpan.end({
+        level: 'ERROR',
+        statusMessage: 'revise LLM failed',
+        metadata: { iteration: i, error: String(err) },
+      });
+      traceFinalize = { error: 'revise LLM failed', exitReason: 'ai_error' };
       await markFailed(
         conversationId,
         'Research failed: the AI provider could not revise the draft. Please try again.',
@@ -1493,13 +1634,20 @@ async function runResearchPipelineImpl(
     record.revised = true;
     const similarity = draftSimilarity(currentDraft, revisedDraft);
     currentDraft = revisedDraft;
+    reviseSpan.end({
+      metadata: { iteration: i, similarity, draftLength: revisedDraft.length },
+    });
     if (similarity >= CONVERGENCE_SIMILARITY_THRESHOLD) {
       exitReason = 'converged';
       break;
     }
   }
 
+  const finalizingSpan = trace.startSpan('finalizing', {
+    metadata: { exitReason, iterationCount: iterations.length },
+  });
   let structuredReport: StructuredReport;
+  let reportSource: 'llm' | 'programmatic' = 'programmatic';
   if (llmCallsRemaining() >= 1 && !abortSignal?.aborted) {
     onProgress?.({ stage: 'finalizing', detail: 'Structuring the final report' });
     const reportRun = await buildStructuredReport({
@@ -1515,6 +1663,7 @@ async function runResearchPipelineImpl(
     });
     llmCallsUsed += reportRun.llmCallsAttempted;
     structuredReport = reportRun.report;
+    reportSource = reportRun.source;
   } else {
     structuredReport = programmaticReportFromDraft(
       currentDraft,
@@ -1524,6 +1673,15 @@ async function runResearchPipelineImpl(
       finalScores,
     );
   }
+  finalizingSpan.end({
+    metadata: {
+      exitReason,
+      iterationCount: iterations.length,
+      reportSource,
+      sourceCount: structuredReport.sources.length,
+      keyFindingsCount: structuredReport.keyFindings.length,
+    },
+  });
 
   const finalMetadata: Record<string, unknown> = {
     kind: 'research_final',
@@ -1569,6 +1727,24 @@ async function runResearchPipelineImpl(
     }).catch((err) => console.error('Research-complete email failed:', err));
   }
 
+  traceFinalize = {
+    exitReason,
+    output: {
+      exitReason,
+      iterationCount: iterations.length,
+      llmCallsUsed,
+      sourceCount: sources.length,
+      queriesCount: queries.length,
+      finalScores,
+    },
+    metadata: {
+      exitReason,
+      iterationCount: iterations.length,
+      llmCallsUsed,
+      sourceCount: sources.length,
+    },
+  };
+
   return {
     kind: 'ok',
     assistantMessage,
@@ -1581,6 +1757,7 @@ async function runResearchPipelineImpl(
     llmCallsUsed,
     report: structuredReport,
   };
+  }
 }
 
 export interface ResearchFinalRecord {

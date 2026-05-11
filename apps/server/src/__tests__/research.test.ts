@@ -46,6 +46,57 @@ vi.mock('../services/email', () => ({
   renderResearchReportText: vi.fn(() => 'text'),
 }));
 
+const traceSpans: {
+  name: string;
+  startOpts?: unknown;
+  updates: unknown[];
+  endOpts?: unknown;
+}[] = [];
+const traceFinishes: unknown[] = [];
+const traceMetadataUpdates: unknown[] = [];
+const traceErrors: string[] = [];
+const traceInits: unknown[] = [];
+
+function clearTraceRecorder(): void {
+  traceSpans.length = 0;
+  traceFinishes.length = 0;
+  traceMetadataUpdates.length = 0;
+  traceErrors.length = 0;
+  traceInits.length = 0;
+}
+
+vi.mock('../services/tracing', () => ({
+  createResearchTrace: vi.fn((init: unknown) => {
+    traceInits.push(init);
+    return {
+      isEnabled: true,
+      startSpan: (name: string, opts: unknown) => {
+        const record = { name, startOpts: opts, updates: [] as unknown[] };
+        traceSpans.push(record);
+        return {
+          update: (body: unknown) => {
+            record.updates.push(body);
+          },
+          end: (body: unknown) => {
+            record.endOpts = body;
+          },
+        };
+      },
+      updateMetadata: (patch: unknown) => {
+        traceMetadataUpdates.push(patch);
+      },
+      markError: (msg: string) => {
+        traceErrors.push(msg);
+      },
+      finish: async (opts: unknown) => {
+        traceFinishes.push(opts);
+      },
+    };
+  }),
+  getLangfuseClient: vi.fn(() => null),
+  _resetLangfuseClient: vi.fn(),
+}));
+
 vi.mock('../services/search', () => ({
   createSearchService: vi.fn(),
   getMaxSearchesPerResearch: vi.fn(() => 20),
@@ -2928,6 +2979,191 @@ describe('Phase 8: preferredModel propagation through the research pipeline', ()
 
     expect(mockedGenerate).toHaveBeenCalled();
     expect(mockedGenerate.mock.calls[0][1]).toBe('openai:gpt-4o-mini');
+  });
+});
+
+describe('runResearchPipeline tracing instrumentation', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearTraceRecorder();
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+    process.env.MAX_RESEARCH_ITERATIONS = '5';
+    process.env.MAX_LLM_CALLS_PER_RESEARCH = '10';
+  });
+
+  function setupOk() {
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini', email: 'u@example.com' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Topic on EU climate impacts', metadata: null },
+      {
+        role: 'assistant',
+        content: '1. Region?',
+        metadata: { kind: 'clarifying_questions', questions: ['Region?'] },
+      },
+      { role: 'user', content: 'EU only', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: focus on EU through 2030.',
+        metadata: { kind: 'research_ready', summary: 'focus on EU through 2030.' },
+      },
+    ] as never);
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    } as never);
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-final',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'final',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+  }
+
+  it('creates a trace, emits searching/drafting/critiquing/finalizing spans, and finishes with exitReason on the happy path', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    expect(traceInits).toHaveLength(1);
+    const init = traceInits[0] as {
+      userId: string;
+      conversationId: string;
+      topic: string;
+      modelId: string;
+      clarifyingAnswers: string[];
+      scopeSummary?: string;
+    };
+    expect(init.userId).toBe(USER_ID);
+    expect(init.conversationId).toBe('conv-1');
+    expect(init.topic).toBe('Topic on EU climate impacts');
+    expect(init.modelId).toBe('openai:gpt-4o-mini');
+    expect(init.clarifyingAnswers).toEqual(['EU only']);
+    expect(init.scopeSummary).toBe('focus on EU through 2030.');
+
+    const spanNames = traceSpans.map((s) => s.name);
+    expect(spanNames).toEqual(['searching', 'drafting', 'critiquing', 'finalizing']);
+
+    expect(traceFinishes).toHaveLength(1);
+    const finish = traceFinishes[0] as {
+      exitReason?: string;
+      output?: { exitReason?: string; sourceCount?: number };
+    };
+    expect(finish.exitReason).toBe('all_passed');
+    expect(finish.output?.exitReason).toBe('all_passed');
+    expect(finish.output?.sourceCount).toBe(3);
+
+    const finalizingEnd = traceSpans.find((s) => s.name === 'finalizing')?.endOpts as
+      | { metadata?: Record<string, unknown> }
+      | undefined;
+    expect(finalizingEnd?.metadata?.exitReason).toBe('all_passed');
+  });
+
+  it('emits fact-checking and revising spans across iterations and finishes with the final exitReason', async () => {
+    setupOk();
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(FAILING_CRITIQUE)
+      .mockResolvedValueOnce('Claim A.\nClaim B.')
+      .mockResolvedValueOnce('Revised draft with very different wording entirely.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const spanNames = traceSpans.map((s) => s.name);
+    expect(spanNames).toEqual([
+      'searching',
+      'drafting',
+      'critiquing',
+      'fact-checking',
+      'revising',
+      'critiquing',
+      'finalizing',
+    ]);
+
+    const factCheck = traceSpans.find((s) => s.name === 'fact-checking');
+    expect(
+      (factCheck?.endOpts as { metadata?: { claimsExtracted?: number } } | undefined)
+        ?.metadata?.claimsExtracted,
+    ).toBe(2);
+
+    const revise = traceSpans.find((s) => s.name === 'revising');
+    expect(
+      (revise?.endOpts as { metadata?: { iteration?: number } } | undefined)?.metadata
+        ?.iteration,
+    ).toBe(1);
+
+    const finish = traceFinishes[0] as { exitReason?: string };
+    expect(finish.exitReason).toBe('all_passed');
+  });
+
+  it('marks the searching span as ERROR and finish with error+exitReason when planning LLM throws', async () => {
+    setupOk();
+    mockedGenerate.mockRejectedValueOnce(new Error('llm down'));
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ai-error');
+
+    const searching = traceSpans.find((s) => s.name === 'searching');
+    expect(
+      (searching?.endOpts as { level?: string; statusMessage?: string } | undefined)
+        ?.level,
+    ).toBe('ERROR');
+    expect(
+      (searching?.endOpts as { statusMessage?: string } | undefined)?.statusMessage,
+    ).toContain('planning');
+
+    const finish = traceFinishes[0] as { error?: string; exitReason?: string };
+    expect(finish.error).toBe('planning LLM failed');
+    expect(finish.exitReason).toBe('ai_error');
+  });
+
+  it('finishes with insufficient_sources exitReason when too few sources gathered', async () => {
+    setupOk();
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+      ]),
+    } as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('insufficient-sources');
+
+    const finish = traceFinishes[0] as { error?: string; exitReason?: string };
+    expect(finish.error).toBe('insufficient sources');
+    expect(finish.exitReason).toBe('insufficient_sources');
   });
 });
 
