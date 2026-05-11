@@ -59,6 +59,173 @@ describe('search service', () => {
     });
   });
 
+  describe('budget accounting helpers', () => {
+    it('exposes total() and used() in addition to remaining()', async () => {
+      process.env.FIRECRAWL_API_KEY = 'k';
+      const fetchImpl = vi.fn().mockImplementation(async () =>
+        fakeJsonResponse(200, {
+          data: [{ title: 't', url: 'https://a.example', description: 's' }],
+        }),
+      );
+      const svc = createSearchService({ budget: 4, fetch: fetchImpl as unknown as typeof fetch });
+      expect(svc.total()).toBe(4);
+      expect(svc.used()).toBe(0);
+      expect(svc.remaining()).toBe(4);
+      await svc.search('q1');
+      await svc.search('q2');
+      expect(svc.total()).toBe(4);
+      expect(svc.used()).toBe(2);
+      expect(svc.remaining()).toBe(2);
+    });
+  });
+
+  describe('parent span instrumentation', () => {
+    function makeFakeParentSpan() {
+      const childEnds: unknown[] = [];
+      const startSpanCalls: { name: string; opts: unknown }[] = [];
+      const parent = {
+        update: vi.fn(),
+        end: vi.fn(),
+        startGeneration: vi.fn(),
+        startSpan: vi.fn((name: string, opts: unknown) => {
+          startSpanCalls.push({ name, opts });
+          return {
+            update: vi.fn(),
+            end: (body: unknown) => {
+              childEnds.push(body);
+            },
+            startGeneration: vi.fn(),
+            startSpan: vi.fn(),
+          };
+        }),
+      };
+      return { parent, childEnds, startSpanCalls };
+    }
+
+    it('emits a child span per successful Firecrawl query with provider + results', async () => {
+      process.env.FIRECRAWL_API_KEY = 'fc';
+      const fetchImpl = vi.fn().mockResolvedValue(
+        fakeJsonResponse(200, {
+          data: [
+            { title: 'A', url: 'https://a.example', description: 'snippet a' },
+            { title: 'B', url: 'https://b.example', description: 'snippet b' },
+          ],
+        }),
+      );
+      const { parent, childEnds, startSpanCalls } = makeFakeParentSpan();
+      const svc = createSearchService({ fetch: fetchImpl as unknown as typeof fetch });
+      await svc.search('eu climate policy', parent as never);
+
+      expect(startSpanCalls).toHaveLength(1);
+      expect(startSpanCalls[0].name).toBe('search-query');
+      expect(startSpanCalls[0].opts).toMatchObject({
+        input: { query: 'eu climate policy' },
+        metadata: { query: 'eu climate policy' },
+      });
+
+      expect(childEnds).toHaveLength(1);
+      const endBody = childEnds[0] as {
+        metadata: {
+          query: string;
+          provider: string;
+          providersTried: string[];
+          fallbackOccurred: boolean;
+          resultCount: number;
+        };
+        output: { results: { url: string }[] };
+      };
+      expect(endBody.metadata.provider).toBe('firecrawl');
+      expect(endBody.metadata.providersTried).toEqual(['firecrawl']);
+      expect(endBody.metadata.fallbackOccurred).toBe(false);
+      expect(endBody.metadata.resultCount).toBe(2);
+      expect(endBody.output.results.map((r) => r.url)).toEqual([
+        'https://a.example',
+        'https://b.example',
+      ]);
+    });
+
+    it('records both providers and fallbackOccurred=true when Brave succeeds after Firecrawl fails', async () => {
+      process.env.FIRECRAWL_API_KEY = 'fc';
+      process.env.BRAVE_SEARCH_API_KEY = 'br';
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(fakeJsonResponse(500, { error: 'boom' }))
+        .mockResolvedValueOnce(
+          fakeJsonResponse(200, {
+            web: {
+              results: [
+                { title: 'BraveOne', url: 'https://brave.example/a', description: 'd' },
+              ],
+            },
+          }),
+        );
+      const { parent, childEnds } = makeFakeParentSpan();
+      const svc = createSearchService({ fetch: fetchImpl as unknown as typeof fetch });
+      await svc.search('q', parent as never);
+
+      const endBody = childEnds[0] as {
+        metadata: {
+          provider: string;
+          providersTried: string[];
+          fallbackOccurred: boolean;
+          resultCount: number;
+        };
+      };
+      expect(endBody.metadata.provider).toBe('brave');
+      expect(endBody.metadata.providersTried).toEqual(['firecrawl', 'brave']);
+      expect(endBody.metadata.fallbackOccurred).toBe(true);
+      expect(endBody.metadata.resultCount).toBe(1);
+    });
+
+    it('ends the child span with ERROR level when every provider fails', async () => {
+      process.env.FIRECRAWL_API_KEY = 'fc';
+      process.env.BRAVE_SEARCH_API_KEY = 'br';
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(fakeJsonResponse(500, {}))
+        .mockResolvedValueOnce(fakeJsonResponse(401, {}));
+      const { parent, childEnds } = makeFakeParentSpan();
+      const svc = createSearchService({ fetch: fetchImpl as unknown as typeof fetch });
+      await expect(svc.search('q', parent as never)).rejects.toBeInstanceOf(SearchProviderError);
+
+      const endBody = childEnds[0] as {
+        level: string;
+        statusMessage: string;
+        metadata: { providersTried: string[]; fallbackOccurred: boolean };
+      };
+      expect(endBody.level).toBe('ERROR');
+      expect(endBody.statusMessage).toBe('all providers failed');
+      expect(endBody.metadata.providersTried).toEqual(['firecrawl', 'brave']);
+      expect(endBody.metadata.fallbackOccurred).toBe(true);
+    });
+
+    it('ends the child span with ERROR level when no provider is configured', async () => {
+      const { parent, childEnds } = makeFakeParentSpan();
+      const svc = createSearchService({ budget: 1 });
+      await expect(svc.search('q', parent as never)).rejects.toBeInstanceOf(SearchProviderError);
+      const endBody = childEnds[0] as {
+        level: string;
+        statusMessage: string;
+        metadata: { providersTried: string[] };
+      };
+      expect(endBody.level).toBe('ERROR');
+      expect(endBody.statusMessage).toBe('no search provider configured');
+      expect(endBody.metadata.providersTried).toEqual([]);
+    });
+
+    it('no-ops cleanly when no parentSpan is supplied', async () => {
+      process.env.FIRECRAWL_API_KEY = 'fc';
+      const fetchImpl = vi.fn().mockResolvedValue(
+        fakeJsonResponse(200, {
+          data: [{ title: 'A', url: 'https://a.example', description: 's' }],
+        }),
+      );
+      const svc = createSearchService({ fetch: fetchImpl as unknown as typeof fetch });
+      const out = await svc.search('q');
+      expect(out).toHaveLength(1);
+    });
+  });
+
   describe('Firecrawl primary path', () => {
     it('parses Firecrawl response into SearchResult[]', async () => {
       process.env.FIRECRAWL_API_KEY = 'fc-key';

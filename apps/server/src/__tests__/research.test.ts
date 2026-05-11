@@ -67,24 +67,32 @@ function clearTraceRecorder(): void {
 
 const noopGen = { end: () => {} };
 
+function buildFakePhaseSpan(
+  name: string,
+  startOpts: unknown,
+): { record: typeof traceSpans[number]; span: Record<string, unknown> } {
+  const record = { name, startOpts, updates: [] as unknown[] };
+  traceSpans.push(record);
+  const span: Record<string, unknown> = {
+    update: (body: unknown) => {
+      record.updates.push(body);
+    },
+    end: (body: unknown) => {
+      record.endOpts = body;
+    },
+    startGeneration: () => noopGen,
+    startSpan: (childName: string, childOpts: unknown) =>
+      buildFakePhaseSpan(`${name}>${childName}`, childOpts).span,
+  };
+  return { record, span };
+}
+
 vi.mock('../services/tracing', () => ({
   createResearchTrace: vi.fn((init: unknown) => {
     traceInits.push(init);
     return {
       isEnabled: true,
-      startSpan: (name: string, opts: unknown) => {
-        const record = { name, startOpts: opts, updates: [] as unknown[] };
-        traceSpans.push(record);
-        return {
-          update: (body: unknown) => {
-            record.updates.push(body);
-          },
-          end: (body: unknown) => {
-            record.endOpts = body;
-          },
-          startGeneration: () => noopGen,
-        };
-      },
+      startSpan: (name: string, opts: unknown) => buildFakePhaseSpan(name, opts).span,
       startGeneration: () => noopGen,
       updateMetadata: (patch: unknown) => {
         traceMetadataUpdates.push(patch);
@@ -3177,6 +3185,78 @@ describe('runResearchPipeline tracing instrumentation', () => {
     const finish = traceFinishes[0] as { error?: string; exitReason?: string };
     expect(finish.error).toBe('insufficient sources');
     expect(finish.exitReason).toBe('insufficient_sources');
+  });
+
+  it('passes the searching span as the parent to every search query and rolls up budget metadata on the span', async () => {
+    setupOk();
+    const used = vi.fn().mockReturnValue(2);
+    const total = vi.fn().mockReturnValue(20);
+    const search = vi.fn().mockResolvedValue([
+      { title: 'A', url: 'https://a.example', snippet: 'sa' },
+      { title: 'B', url: 'https://b.example', snippet: 'sb' },
+      { title: 'C', url: 'https://c.example', snippet: 'sc' },
+    ]);
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(18),
+      total,
+      used,
+      search,
+    } as never);
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Initial draft.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('ok');
+
+    const searching = traceSpans.find((s) => s.name === 'searching');
+    expect(searching).toBeDefined();
+
+    // The orchestrator passed the searching span object as the second argument
+    // to every search.search() call so the search service can hang per-query
+    // child spans off it in the Langfuse trace.
+    expect(search).toHaveBeenCalledTimes(2);
+    for (const callArgs of search.mock.calls) {
+      expect(callArgs[1]).toBeDefined();
+      expect(typeof (callArgs[1] as { startSpan?: unknown }).startSpan).toBe('function');
+    }
+    expect(search.mock.calls[0][0]).toBe('q1');
+    expect(search.mock.calls[1][0]).toBe('q2');
+
+    const endMeta = (searching?.endOpts as { metadata?: Record<string, unknown> } | undefined)
+      ?.metadata;
+    expect(endMeta?.searchBudgetUsed).toBe(2);
+    expect(endMeta?.searchBudgetTotal).toBe(20);
+    expect(endMeta?.uniqueSourcesFound).toBe(3);
+    expect(endMeta?.minSourceThreshold).toBe(3);
+    expect(endMeta?.minSourceThresholdMet).toBe(true);
+  });
+
+  it('records minSourceThresholdMet=false on the searching span when too few sources are gathered', async () => {
+    setupOk();
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(20),
+      total: vi.fn().mockReturnValue(20),
+      used: vi.fn().mockReturnValue(2),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+      ]),
+    } as never);
+    mockedGenerate.mockResolvedValueOnce('q1\nq2');
+
+    const out = await runResearchPipeline({ userId: USER_ID, conversationId: 'conv-1' });
+    expect(out.kind).toBe('insufficient-sources');
+
+    const searching = traceSpans.find((s) => s.name === 'searching');
+    const endOpts = searching?.endOpts as
+      | { level?: string; metadata?: Record<string, unknown> }
+      | undefined;
+    expect(endOpts?.level).toBe('ERROR');
+    expect(endOpts?.metadata?.minSourceThresholdMet).toBe(false);
+    expect(endOpts?.metadata?.uniqueSourcesFound).toBe(1);
+    expect(endOpts?.metadata?.searchBudgetTotal).toBe(20);
   });
 
   it('threads a tracing context + named generation onto every LLM call', async () => {

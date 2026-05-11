@@ -75,15 +75,16 @@ export interface GenerationSpan {
   end(opts?: EndGenerationOptions): void;
 }
 
+export interface StartSpanOptions {
+  input?: unknown;
+  metadata?: Record<string, unknown>;
+}
+
 export interface PhaseSpan {
   update(body: PhaseSpanUpdate): void;
   end(body?: PhaseSpanUpdate): void;
   startGeneration(name: string, opts: StartGenerationOptions): GenerationSpan;
-}
-
-export interface StartSpanOptions {
-  input?: unknown;
-  metadata?: Record<string, unknown>;
+  startSpan(name: string, opts?: StartSpanOptions): PhaseSpan;
 }
 
 export interface FinishTraceOptions {
@@ -130,6 +131,7 @@ const noopSpan: PhaseSpan = {
   update() {},
   end() {},
   startGeneration: () => noopGeneration,
+  startSpan: () => noopSpan,
 };
 
 const zeroTotals: TraceCostTotals = Object.freeze({
@@ -229,6 +231,20 @@ function wrapSpan(
     },
     startGeneration(name, opts) {
       return buildGeneration(span, name, opts, onGenerationEnd);
+    },
+    startSpan(name, opts) {
+      const child = safe(
+        () =>
+          span.span({
+            name,
+            input: opts?.input,
+            metadata: opts?.metadata,
+            startTime: new Date(),
+          }),
+        null,
+        `span(${name}) create`,
+      );
+      return child ? wrapSpan(child, onGenerationEnd) : noopSpan;
     },
   };
 }

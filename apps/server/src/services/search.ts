@@ -1,3 +1,5 @@
+import type { PhaseSpan } from './tracing';
+
 const DEFAULT_MAX_SEARCHES = 20;
 const SEARCH_TIMEOUT_MS = 30_000;
 const RESULTS_PER_QUERY = 5;
@@ -33,8 +35,10 @@ export class SearchProviderError extends Error {
 }
 
 export interface SearchService {
-  search(query: string): Promise<SearchResult[]>;
+  search(query: string, parentSpan?: PhaseSpan): Promise<SearchResult[]>;
   remaining(): number;
+  total(): number;
+  used(): number;
 }
 
 export interface CreateSearchServiceOptions {
@@ -44,12 +48,18 @@ export interface CreateSearchServiceOptions {
 
 export function createSearchService(options: CreateSearchServiceOptions = {}): SearchService {
   const fetchImpl = options.fetch ?? globalThis.fetch;
-  let remaining = options.budget ?? getMaxSearchesPerResearch();
+  const total = options.budget ?? getMaxSearchesPerResearch();
+  let remaining = total;
 
   return {
-    async search(query: string) {
+    async search(query: string, parentSpan?: PhaseSpan) {
       if (remaining <= 0) throw new SearchBudgetExhaustedError();
       remaining -= 1;
+
+      const span = parentSpan?.startSpan('search-query', {
+        input: { query },
+        metadata: { query },
+      });
 
       const tried: string[] = [];
       const firecrawlConfigured = Boolean(process.env.FIRECRAWL_API_KEY);
@@ -58,7 +68,18 @@ export function createSearchService(options: CreateSearchServiceOptions = {}): S
       if (firecrawlConfigured) {
         tried.push('firecrawl');
         try {
-          return await searchFirecrawl(fetchImpl, query);
+          const results = await searchFirecrawl(fetchImpl, query);
+          span?.end({
+            metadata: {
+              query,
+              provider: 'firecrawl',
+              providersTried: [...tried],
+              fallbackOccurred: false,
+              resultCount: results.length,
+            },
+            output: { results },
+          });
+          return results;
         } catch (err) {
           console.warn(`Firecrawl search failed for "${query}":`, err);
         }
@@ -67,18 +88,43 @@ export function createSearchService(options: CreateSearchServiceOptions = {}): S
       if (braveConfigured) {
         tried.push('brave');
         try {
-          return await searchBrave(fetchImpl, query);
+          const results = await searchBrave(fetchImpl, query);
+          span?.end({
+            metadata: {
+              query,
+              provider: 'brave',
+              providersTried: [...tried],
+              fallbackOccurred: tried.length > 1,
+              resultCount: results.length,
+            },
+            output: { results },
+          });
+          return results;
         } catch (err) {
           console.warn(`Brave search failed for "${query}":`, err);
         }
       }
 
       if (tried.length === 0) {
+        span?.end({
+          level: 'ERROR',
+          statusMessage: 'no search provider configured',
+          metadata: { query, providersTried: [] },
+        });
         throw new SearchProviderError(
           'No search provider configured (set FIRECRAWL_API_KEY or BRAVE_SEARCH_API_KEY)',
           [],
         );
       }
+      span?.end({
+        level: 'ERROR',
+        statusMessage: 'all providers failed',
+        metadata: {
+          query,
+          providersTried: [...tried],
+          fallbackOccurred: tried.length > 1,
+        },
+      });
       throw new SearchProviderError(
         `All configured search providers failed for query: ${query}`,
         tried,
@@ -86,6 +132,12 @@ export function createSearchService(options: CreateSearchServiceOptions = {}): S
     },
     remaining() {
       return remaining;
+    },
+    total() {
+      return total;
+    },
+    used() {
+      return total - remaining;
     },
   };
 }

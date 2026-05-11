@@ -1,6 +1,7 @@
 import { prisma } from '../lib/db';
 import { Prisma } from '../generated/prisma/client';
 import { generateAssistantText, type TracingContext } from './ai';
+import type { PhaseSpan } from './tracing';
 import { sendResearchCompleteEmail } from './email';
 import { DEFAULT_MODEL_ID, isSupportedModel } from './models';
 import type { LLMMessage } from './context';
@@ -616,7 +617,7 @@ export interface FactCheckOptions {
   modelId: string;
   generateFn?: typeof generateAssistantText;
   abortSignal?: AbortSignal;
-  traceParent?: TracingContext;
+  traceParent?: PhaseSpan;
   iteration?: number;
 }
 
@@ -682,7 +683,7 @@ export async function factCheckDraft(opts: FactCheckOptions): Promise<FactCheckR
       continue;
     }
     try {
-      const hits = await search.search(claim);
+      const hits = await search.search(claim, traceParent);
       searchesUsed += 1;
       const urls = hits.map((h) => h.url).filter(Boolean).slice(0, 3);
       const status: FactCheckStatus = urls.length > 0 ? 'verified' : 'unverified';
@@ -1081,6 +1082,28 @@ function readyMessageSummary(metadata: unknown): string | null {
   return null;
 }
 
+function readSearchUsed(svc: SearchService): number | undefined {
+  if (typeof svc.used === 'function') {
+    try {
+      return svc.used();
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function readSearchTotal(svc: SearchService): number | undefined {
+  if (typeof svc.total === 'function') {
+    try {
+      return svc.total();
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 async function markFailed(conversationId: string, message?: string): Promise<void> {
   try {
     await prisma.conversation.update({
@@ -1306,7 +1329,7 @@ async function runResearchPipelineImpl(
       query,
     });
     try {
-      const results = await search.search(query);
+      const results = await search.search(query, searchSpan);
       for (const r of results) {
         if (!seenUrls.has(r.url)) {
           seenUrls.add(r.url);
@@ -1325,12 +1348,25 @@ async function runResearchPipelineImpl(
     }
   }
 
+  const searchBudgetUsed = readSearchUsed(search);
+  const searchBudgetTotal = readSearchTotal(search);
+  const minSourceThresholdMet = sources.length >= MIN_SOURCES_REQUIRED;
+
   if (sources.length < MIN_SOURCES_REQUIRED) {
     if (providerErrors >= queries.length) {
       searchSpan.end({
         level: 'ERROR',
         statusMessage: 'all search providers failed',
-        metadata: { queries, providerErrors, sourcesFound: sources.length },
+        metadata: {
+          queries,
+          providerErrors,
+          sourcesFound: sources.length,
+          uniqueSourcesFound: sources.length,
+          minSourceThreshold: MIN_SOURCES_REQUIRED,
+          minSourceThresholdMet,
+          searchBudgetUsed,
+          searchBudgetTotal,
+        },
       });
       traceFinalize = {
         error: 'all search providers failed',
@@ -1348,7 +1384,16 @@ async function runResearchPipelineImpl(
     searchSpan.end({
       level: 'ERROR',
       statusMessage: 'insufficient sources',
-      metadata: { queries, providerErrors, sourcesFound: sources.length },
+      metadata: {
+        queries,
+        providerErrors,
+        sourcesFound: sources.length,
+        uniqueSourcesFound: sources.length,
+        minSourceThreshold: MIN_SOURCES_REQUIRED,
+        minSourceThresholdMet,
+        searchBudgetUsed,
+        searchBudgetTotal,
+      },
     });
     traceFinalize = {
       error: 'insufficient sources',
@@ -1365,8 +1410,12 @@ async function runResearchPipelineImpl(
     metadata: {
       queries,
       sourcesFound: sources.length,
+      uniqueSourcesFound: sources.length,
       providerErrors,
       minSourceThreshold: MIN_SOURCES_REQUIRED,
+      minSourceThresholdMet,
+      searchBudgetUsed,
+      searchBudgetTotal,
     },
     output: { sources },
   });

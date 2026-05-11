@@ -6,10 +6,19 @@ vi.mock('langfuse', () => {
   const spanEnd = vi.fn();
   const generationEnd = vi.fn();
   const spanGeneration = vi.fn(() => ({ end: generationEnd }));
+  const childSpanUpdate = vi.fn();
+  const childSpanEnd = vi.fn();
+  const spanSpan = vi.fn(() => ({
+    update: childSpanUpdate,
+    end: childSpanEnd,
+    generation: spanGeneration,
+    span: spanSpan,
+  }));
   const traceSpan = vi.fn(() => ({
     update: spanUpdate,
     end: spanEnd,
     generation: spanGeneration,
+    span: spanSpan,
   }));
   const traceGeneration = vi.fn(() => ({ end: generationEnd }));
   const flushAsync = vi.fn().mockResolvedValue(undefined);
@@ -34,6 +43,9 @@ vi.mock('langfuse', () => {
       generationEnd,
       spanGeneration,
       traceGeneration,
+      spanSpan,
+      childSpanUpdate,
+      childSpanEnd,
     },
   };
 });
@@ -56,6 +68,9 @@ const mocks = (langfuseMock as unknown as {
     generationEnd: ReturnType<typeof vi.fn>;
     spanGeneration: ReturnType<typeof vi.fn>;
     traceGeneration: ReturnType<typeof vi.fn>;
+    spanSpan: ReturnType<typeof vi.fn>;
+    childSpanUpdate: ReturnType<typeof vi.fn>;
+    childSpanEnd: ReturnType<typeof vi.fn>;
   };
 }).__mocks;
 
@@ -71,11 +86,21 @@ describe('tracing service', () => {
     mocks.spanGeneration.mockImplementation(() => ({ end: mocks.generationEnd }));
     mocks.traceGeneration.mockReset();
     mocks.traceGeneration.mockImplementation(() => ({ end: mocks.generationEnd }));
+    mocks.spanSpan.mockReset();
+    mocks.childSpanUpdate.mockReset();
+    mocks.childSpanEnd.mockReset();
+    mocks.spanSpan.mockImplementation(() => ({
+      update: mocks.childSpanUpdate,
+      end: mocks.childSpanEnd,
+      generation: mocks.spanGeneration,
+      span: mocks.spanSpan,
+    }));
     mocks.traceSpan.mockReset();
     mocks.traceSpan.mockImplementation(() => ({
       update: mocks.spanUpdate,
       end: mocks.spanEnd,
       generation: mocks.spanGeneration,
+      span: mocks.spanSpan,
     }));
     mocks.flushAsync.mockReset();
     mocks.flushAsync.mockResolvedValue(undefined);
@@ -428,6 +453,58 @@ describe('tracing service', () => {
       expect(totals.totalCost).toBe(0);
     });
 
+    it('span.startSpan creates a nested child span under the parent', () => {
+      const trace = createResearchTrace({
+        userId: 'u',
+        conversationId: 'c',
+        topic: 't',
+        modelId: 'openai:gpt-4o-mini',
+        clarifyingAnswers: [],
+      });
+      const parent = trace.startSpan('searching');
+      const child = parent.startSpan('search-query', {
+        input: { query: 'eu climate policy' },
+        metadata: { query: 'eu climate policy' },
+      });
+      expect(mocks.spanSpan).toHaveBeenCalledTimes(1);
+      const createArgs = mocks.spanSpan.mock.calls[0][0] as {
+        name: string;
+        input: { query: string };
+        metadata: { query: string };
+      };
+      expect(createArgs.name).toBe('search-query');
+      expect(createArgs.input.query).toBe('eu climate policy');
+      expect(createArgs.metadata.query).toBe('eu climate policy');
+
+      child.end({
+        metadata: { provider: 'firecrawl', resultCount: 3 },
+        output: { results: [] },
+      });
+      expect(mocks.childSpanEnd).toHaveBeenCalledTimes(1);
+      const endArgs = mocks.childSpanEnd.mock.calls[0][0] as {
+        metadata: { provider: string; resultCount: number };
+        output: unknown;
+      };
+      expect(endArgs.metadata.provider).toBe('firecrawl');
+      expect(endArgs.metadata.resultCount).toBe(3);
+    });
+
+    it('isolates nested span creation throws and continues with a noop', () => {
+      mocks.spanSpan.mockImplementationOnce(() => {
+        throw new Error('child create failed');
+      });
+      const trace = createResearchTrace({
+        userId: 'u',
+        conversationId: 'c',
+        topic: 't',
+        modelId: 'openai:gpt-4o-mini',
+        clarifyingAnswers: [],
+      });
+      const parent = trace.startSpan('searching');
+      const child = parent.startSpan('search-query');
+      expect(() => child.end({ metadata: { resultCount: 1 } })).not.toThrow();
+    });
+
     it('trace.startGeneration attaches a generation directly to the trace', () => {
       const trace = createResearchTrace({
         userId: 'u',
@@ -466,6 +543,20 @@ describe('tracing service', () => {
         totalCost: 0,
         generations: 0,
       });
+    });
+
+    it('returns a no-op nested span when tracing is unconfigured', () => {
+      const trace = createResearchTrace({
+        userId: 'u',
+        conversationId: 'c',
+        topic: 't',
+        modelId: 'openai:gpt-4o-mini',
+        clarifyingAnswers: [],
+      });
+      const parent = trace.startSpan('searching');
+      const child = parent.startSpan('search-query', { metadata: { query: 'x' } });
+      expect(() => child.update({ metadata: { y: 1 } })).not.toThrow();
+      expect(() => child.end({ metadata: { z: 1 } })).not.toThrow();
     });
   });
 });
