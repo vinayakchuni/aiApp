@@ -1,4 +1,5 @@
 import { prisma } from '../lib/db';
+import type { ConversationMode } from '../generated/prisma/enums';
 
 export const DEFAULT_CONVERSATION_TITLE = 'New conversation';
 export const AUTO_TITLE_MAX_LENGTH = 50;
@@ -19,11 +20,21 @@ export type AppendUserMessageOutcome =
   | { kind: 'not-found' }
   | { kind: 'too-many-messages' };
 
-export async function createConversation(userId: string, title?: string) {
+export interface CreateConversationOptions {
+  title?: string;
+  mode?: ConversationMode;
+}
+
+export async function createConversation(
+  userId: string,
+  options: CreateConversationOptions = {},
+) {
+  const { title, mode } = options;
   return prisma.conversation.create({
     data: {
       userId,
       ...(title ? { title } : {}),
+      ...(mode ? { mode } : {}),
     },
   });
 }
@@ -46,6 +57,51 @@ export async function renameConversation(
     where: { id: conversationId },
     data: { title },
   });
+}
+
+export type SetModeOutcome =
+  | { kind: 'ok'; conversation: Awaited<ReturnType<typeof prisma.conversation.update>> }
+  | { kind: 'not-found' }
+  | { kind: 'has-messages' };
+
+export async function setConversationMode(
+  userId: string,
+  conversationId: string,
+  mode: ConversationMode,
+): Promise<SetModeOutcome> {
+  const conversation = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: {
+      id: true,
+      userId: true,
+      mode: true,
+      _count: { select: { messages: true } },
+    },
+  });
+
+  if (!conversation || conversation.userId !== userId) {
+    return { kind: 'not-found' };
+  }
+
+  if (conversation.mode === mode) {
+    const unchanged = await prisma.conversation.findUniqueOrThrow({
+      where: { id: conversationId },
+    });
+    return { kind: 'ok', conversation: unchanged };
+  }
+
+  if (conversation._count.messages > 0) {
+    return { kind: 'has-messages' };
+  }
+
+  const updated = await prisma.conversation.update({
+    where: { id: conversationId },
+    data: {
+      mode,
+      researchStatus: 'idle',
+    },
+  });
+  return { kind: 'ok', conversation: updated };
 }
 
 export async function deleteConversation(userId: string, conversationId: string) {

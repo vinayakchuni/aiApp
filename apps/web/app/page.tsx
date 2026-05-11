@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   Conversation,
   ConversationFile,
+  ConversationMode,
   ConversationWithMessages,
   Message,
   UserResponse,
@@ -137,8 +138,8 @@ export default function Home() {
     abortControllerRef.current?.abort();
   }
 
-  async function handleNewConversation() {
-    const res = await apiPost('/api/conversations', {});
+  async function handleNewConversation(mode: ConversationMode = 'chat') {
+    const res = await apiPost('/api/conversations', mode === 'chat' ? {} : { mode });
     const data = await res.json();
     if (data.success) {
       const conversation = data.conversation as Conversation;
@@ -148,10 +149,180 @@ export default function Home() {
     }
   }
 
+  async function toggleResearchMode() {
+    if (!activeId || !activeConversation) return;
+    if (activeConversation.messages.length > 0) return;
+    const nextMode: ConversationMode =
+      activeConversation.mode === 'research' ? 'chat' : 'research';
+    const previous = activeConversation;
+    setActiveConversation((prev) =>
+      prev && prev.id === activeId ? { ...prev, mode: nextMode, researchStatus: 'idle' } : prev,
+    );
+    const res = await apiPatch(`/api/conversations/${activeId}`, { mode: nextMode });
+    if (!res.ok) {
+      setActiveConversation(previous);
+      const data = await res.json().catch(() => ({}));
+      addToast(data?.error || 'Could not change mode.');
+      return;
+    }
+    const data = await res.json();
+    if (data.success && data.conversation) {
+      const updated = data.conversation as Conversation;
+      setActiveConversation((prev) =>
+        prev && prev.id === activeId
+          ? { ...prev, mode: updated.mode, researchStatus: updated.researchStatus }
+          : prev,
+      );
+      setConversations((prev) =>
+        prev.map((c) => (c.id === activeId ? { ...c, mode: updated.mode, researchStatus: updated.researchStatus } : c)),
+      );
+    }
+  }
+
+  async function handleSendResearchTopic(topic: string) {
+    if (!activeId) return;
+    const optimisticId = `optimistic-user-${Date.now()}`;
+    const optimisticMessage: Message = {
+      id: optimisticId,
+      conversationId: activeId,
+      role: 'user',
+      content: topic,
+      createdAt: new Date().toISOString(),
+    };
+    setActiveConversation((prev) =>
+      prev ? { ...prev, messages: [...prev.messages, optimisticMessage] } : prev,
+    );
+    setDraft('');
+    setIsSending(true);
+    try {
+      const res = await apiPost(`/api/conversations/${activeId}/research`, { topic });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        setActiveConversation((prev) =>
+          prev ? { ...prev, messages: prev.messages.filter((m) => m.id !== optimisticId) } : prev,
+        );
+        addToast(data?.error || 'Could not start research.');
+        return;
+      }
+      const userMessage = data.userMessage as Message;
+      const assistantMessage = data.assistantMessage as Message;
+      const updatedConv = data.conversation as Conversation;
+      setActiveConversation((prev) =>
+        prev
+          ? {
+              ...prev,
+              mode: updatedConv.mode,
+              researchStatus: updatedConv.researchStatus,
+              messages: [
+                ...prev.messages.filter((m) => m.id !== optimisticId),
+                userMessage,
+                assistantMessage,
+              ],
+            }
+          : prev,
+      );
+      setConversations((prev) => {
+        const others = prev.filter((c) => c.id !== activeId);
+        const current = prev.find((c) => c.id === activeId);
+        if (!current) return prev;
+        const nextTitle =
+          current.title === DEFAULT_CONVERSATION_TITLE
+            ? topic.slice(0, AUTO_TITLE_MAX_LENGTH) || current.title
+            : current.title;
+        return [
+          {
+            ...current,
+            title: nextTitle,
+            mode: updatedConv.mode,
+            researchStatus: updatedConv.researchStatus,
+            updatedAt: new Date().toISOString(),
+          },
+          ...others,
+        ];
+      });
+    } catch (err) {
+      console.error(err);
+      setActiveConversation((prev) =>
+        prev ? { ...prev, messages: prev.messages.filter((m) => m.id !== optimisticId) } : prev,
+      );
+      addToast('Network error. Please try again.');
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  async function handleSendClarifyingAnswer(content: string) {
+    if (!activeId) return;
+    const optimisticId = `optimistic-user-${Date.now()}`;
+    const optimisticMessage: Message = {
+      id: optimisticId,
+      conversationId: activeId,
+      role: 'user',
+      content,
+      createdAt: new Date().toISOString(),
+    };
+    setActiveConversation((prev) =>
+      prev ? { ...prev, messages: [...prev.messages, optimisticMessage] } : prev,
+    );
+    setDraft('');
+    setIsSending(true);
+    try {
+      const res = await apiPost(
+        `/api/conversations/${activeId}/messages?stream=false`,
+        { content },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        setActiveConversation((prev) =>
+          prev ? { ...prev, messages: prev.messages.filter((m) => m.id !== optimisticId) } : prev,
+        );
+        addToast(data?.error || 'Could not send answer.');
+        return;
+      }
+      const userMessage = data.userMessage as Message;
+      const assistantMessage = data.assistantMessage as Message;
+      const updatedConv = data.conversation as Conversation | undefined;
+      setActiveConversation((prev) =>
+        prev
+          ? {
+              ...prev,
+              ...(updatedConv
+                ? { mode: updatedConv.mode, researchStatus: updatedConv.researchStatus }
+                : {}),
+              messages: [
+                ...prev.messages.filter((m) => m.id !== optimisticId),
+                userMessage,
+                assistantMessage,
+              ],
+            }
+          : prev,
+      );
+    } catch (err) {
+      console.error(err);
+      setActiveConversation((prev) =>
+        prev ? { ...prev, messages: prev.messages.filter((m) => m.id !== optimisticId) } : prev,
+      );
+      addToast('Network error. Please try again.');
+    } finally {
+      setIsSending(false);
+    }
+  }
+
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
     const content = draft.trim();
     if (!content || !activeId || isSending) return;
+
+    if (activeConversation?.mode === 'research') {
+      if (activeConversation.researchStatus === 'idle') {
+        await handleSendResearchTopic(content);
+        return;
+      }
+      if (activeConversation.researchStatus === 'clarifying') {
+        await handleSendClarifyingAnswer(content);
+        return;
+      }
+    }
 
     setIsSending(true);
     setConversationFull(false);
@@ -487,10 +658,17 @@ export default function Home() {
           <h2 className="text-sm font-semibold text-gray-900">Conversations</h2>
           <div className="flex items-center gap-2">
             <button
-              onClick={handleNewConversation}
+              onClick={() => void handleNewConversation('chat')}
               className="rounded-md bg-blue-600 px-2 py-1 text-xs font-medium text-white shadow-sm hover:bg-blue-500"
             >
-              + New
+              + Chat
+            </button>
+            <button
+              onClick={() => void handleNewConversation('research')}
+              title="Start a new research conversation"
+              className="rounded-md bg-purple-600 px-2 py-1 text-xs font-medium text-white shadow-sm hover:bg-purple-500"
+            >
+              + Research
             </button>
             <button
               onClick={() => setSidebarOpen(false)}
@@ -549,7 +727,17 @@ export default function Home() {
                           : 'text-gray-700'
                       }`}
                     >
-                      {c.title}
+                      <span className="flex items-center gap-2">
+                        {c.mode === 'research' && (
+                          <span
+                            title="Research conversation"
+                            className="inline-flex h-4 items-center rounded-sm bg-purple-100 px-1.5 text-[10px] font-semibold uppercase tracking-wide text-purple-700"
+                          >
+                            Research
+                          </span>
+                        )}
+                        <span className="truncate">{c.title}</span>
+                      </span>
                     </button>
                     <div className="flex items-center gap-1 pr-2 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
                       <button
@@ -617,18 +805,46 @@ export default function Home() {
                   </svg>
                 </button>
                 <h1 className="truncate text-sm font-semibold text-gray-900">{activeConversation.title}</h1>
+                {activeConversation.mode === 'research' && (
+                  <span
+                    title={`Research status: ${activeConversation.researchStatus}`}
+                    className="inline-flex items-center rounded-full bg-purple-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-purple-700"
+                  >
+                    Research
+                  </span>
+                )}
               </div>
-              {settings ? (
-                <button
-                  type="button"
-                  onClick={() => setIsSettingsOpen(true)}
-                  title="Change model or streaming preference"
-                  className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
-                >
-                  {settings.models.find((m) => m.id === settings.preferredModel)?.label ??
-                    settings.preferredModel}
-                </button>
-              ) : null}
+              <div className="flex items-center gap-2">
+                {activeConversation.messages.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => void toggleResearchMode()}
+                    title={
+                      activeConversation.mode === 'research'
+                        ? 'Switch to regular chat'
+                        : 'Switch to research mode'
+                    }
+                    className={`rounded-md border px-2 py-1 text-xs font-medium ${
+                      activeConversation.mode === 'research'
+                        ? 'border-purple-300 bg-purple-50 text-purple-700 hover:bg-purple-100'
+                        : 'border-gray-200 bg-white text-gray-700 hover:bg-gray-50'
+                    }`}
+                  >
+                    {activeConversation.mode === 'research' ? 'Research: ON' : 'Research: OFF'}
+                  </button>
+                )}
+                {settings ? (
+                  <button
+                    type="button"
+                    onClick={() => setIsSettingsOpen(true)}
+                    title="Change model or streaming preference"
+                    className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
+                  >
+                    {settings.models.find((m) => m.id === settings.preferredModel)?.label ??
+                      settings.preferredModel}
+                  </button>
+                ) : null}
+              </div>
             </header>
             <div
               ref={scrollContainerRef}
@@ -638,7 +854,14 @@ export default function Home() {
               <ul className="mx-auto flex max-w-3xl flex-col gap-3">
                 {activeConversation.messages.length === 0 ? (
                   <li className="py-8 text-center text-sm text-gray-500">
-                    Send a message to start the conversation.
+                    {activeConversation.mode === 'research' ? (
+                      <>
+                        Research mode is on. Enter a topic to begin — the agent will ask
+                        clarifying questions before kicking off research.
+                      </>
+                    ) : (
+                      <>Send a message to start the conversation.</>
+                    )}
                   </li>
                 ) : (
                   activeConversation.messages.map((m) => {
@@ -699,7 +922,7 @@ export default function Home() {
                   This conversation has reached the message limit.{' '}
                   <button
                     type="button"
-                    onClick={handleNewConversation}
+                    onClick={() => void handleNewConversation('chat')}
                     className="font-semibold underline hover:text-amber-900"
                   >
                     Start a new conversation
@@ -764,7 +987,17 @@ export default function Home() {
                     type="text"
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
-                    placeholder={conversationFull ? 'Message limit reached' : 'Type a message...'}
+                    placeholder={
+                      conversationFull
+                        ? 'Message limit reached'
+                        : activeConversation.mode === 'research' &&
+                            activeConversation.researchStatus === 'idle'
+                          ? 'Enter your research topic...'
+                          : activeConversation.mode === 'research' &&
+                              activeConversation.researchStatus === 'clarifying'
+                            ? 'Answer the clarifying questions...'
+                            : 'Type a message...'
+                    }
                     disabled={isSending || conversationFull}
                     className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
                   />
@@ -792,12 +1025,20 @@ export default function Home() {
                 </svg>
               </button>
               <p className="text-sm text-gray-600">No conversation selected.</p>
-              <button
-                onClick={handleNewConversation}
-                className="mt-3 rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500"
-              >
-                Start a new conversation
-              </button>
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                <button
+                  onClick={() => void handleNewConversation('chat')}
+                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500"
+                >
+                  New chat
+                </button>
+                <button
+                  onClick={() => void handleNewConversation('research')}
+                  className="rounded-md bg-purple-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-purple-500"
+                >
+                  New research
+                </button>
+              </div>
             </div>
           </div>
         )}

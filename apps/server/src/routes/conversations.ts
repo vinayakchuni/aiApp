@@ -10,6 +10,7 @@ import {
   appendAssistantMessage,
   renameConversation,
   deleteConversation,
+  setConversationMode,
 } from '../services/conversation';
 import { buildModelMessages } from '../services/context';
 import { streamAssistantText, generateAssistantText } from '../services/ai';
@@ -20,7 +21,13 @@ import {
   listFilesForConversation,
   getMaxFileSizeBytes,
 } from '../services/files';
+import { startResearch, processClarifyingAnswer } from '../services/research';
 import { prisma } from '../lib/db';
+import type { ConversationMode } from '../generated/prisma/enums';
+
+function isConversationMode(value: unknown): value is ConversationMode {
+  return value === 'chat' || value === 'research';
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -34,9 +41,17 @@ conversationsRouter.post(
   csrfProtection,
   requireAuth,
   async (req: AuthenticatedRequest, res) => {
-    const { title } = (req.body ?? {}) as { title?: string };
+    const { title, mode } = (req.body ?? {}) as { title?: string; mode?: unknown };
 
-    const conversation = await createConversation(req.user!.id, title);
+    if (mode !== undefined && !isConversationMode(mode)) {
+      res.status(400).json({ success: false, error: 'Invalid mode' });
+      return;
+    }
+
+    const conversation = await createConversation(req.user!.id, {
+      title,
+      mode: mode as ConversationMode | undefined,
+    });
 
     res.status(201).json({ success: true, conversation });
   },
@@ -65,22 +80,59 @@ conversationsRouter.patch(
   csrfProtection,
   requireAuth,
   async (req: AuthenticatedRequest, res) => {
-    const { title } = (req.body ?? {}) as { title?: string };
+    const { title, mode } = (req.body ?? {}) as { title?: string; mode?: unknown };
+    const id = String(req.params.id);
 
-    if (typeof title !== 'string' || title.trim().length === 0) {
+    const wantsRename = title !== undefined;
+    const wantsModeChange = mode !== undefined;
+
+    if (!wantsRename && !wantsModeChange) {
+      res.status(400).json({ success: false, error: 'No fields to update' });
+      return;
+    }
+
+    if (wantsRename && (typeof title !== 'string' || title.trim().length === 0)) {
       res.status(400).json({ success: false, error: 'Title is required' });
       return;
     }
 
-    const id = String(req.params.id);
-    const conversation = await renameConversation(req.user!.id, id, title.trim());
-
-    if (!conversation) {
-      res.status(404).json({ success: false, error: 'Conversation not found' });
+    if (wantsModeChange && !isConversationMode(mode)) {
+      res.status(400).json({ success: false, error: 'Invalid mode' });
       return;
     }
 
-    res.json({ success: true, conversation });
+    let updated: Awaited<ReturnType<typeof renameConversation>> = null;
+
+    if (wantsRename) {
+      updated = await renameConversation(req.user!.id, id, (title as string).trim());
+      if (!updated) {
+        res.status(404).json({ success: false, error: 'Conversation not found' });
+        return;
+      }
+    }
+
+    if (wantsModeChange) {
+      const outcome = await setConversationMode(
+        req.user!.id,
+        id,
+        mode as ConversationMode,
+      );
+      if (outcome.kind === 'not-found') {
+        res.status(404).json({ success: false, error: 'Conversation not found' });
+        return;
+      }
+      if (outcome.kind === 'has-messages') {
+        res.status(409).json({
+          success: false,
+          error: 'Cannot change mode on a conversation that already has messages',
+          code: 'CONVERSATION_NOT_EMPTY',
+        });
+        return;
+      }
+      updated = outcome.conversation;
+    }
+
+    res.json({ success: true, conversation: updated });
   },
 );
 
@@ -218,6 +270,54 @@ conversationsRouter.delete(
 );
 
 conversationsRouter.post(
+  '/:id/research',
+  csrfProtection,
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const { topic } = (req.body ?? {}) as { topic?: string };
+
+    if (typeof topic !== 'string' || topic.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'Research topic is required' });
+      return;
+    }
+
+    const id = String(req.params.id);
+    const outcome = await startResearch(req.user!.id, id, topic.trim());
+
+    switch (outcome.kind) {
+      case 'not-found':
+        res.status(404).json({ success: false, error: 'Conversation not found' });
+        return;
+      case 'wrong-mode':
+        res.status(409).json({
+          success: false,
+          error: 'Conversation is not in research mode',
+          code: 'NOT_RESEARCH_MODE',
+        });
+        return;
+      case 'wrong-status':
+        res.status(409).json({
+          success: false,
+          error: 'Research has already been started for this conversation',
+          code: 'RESEARCH_ALREADY_STARTED',
+        });
+        return;
+      case 'ai-error':
+        res.status(502).json({ success: false, error: 'AI provider error' });
+        return;
+      case 'ok':
+        res.status(201).json({
+          success: true,
+          conversation: outcome.conversation,
+          userMessage: outcome.userMessage,
+          assistantMessage: outcome.assistantMessage,
+        });
+        return;
+    }
+  },
+);
+
+conversationsRouter.post(
   '/:id/messages',
   csrfProtection,
   requireAuth,
@@ -230,6 +330,56 @@ conversationsRouter.post(
     }
 
     const id = String(req.params.id);
+
+    const conversationMeta = await prisma.conversation.findUnique({
+      where: { id },
+      select: { id: true, userId: true, mode: true, researchStatus: true },
+    });
+
+    if (conversationMeta && conversationMeta.userId === req.user!.id) {
+      if (
+        conversationMeta.mode === 'research' &&
+        conversationMeta.researchStatus === 'clarifying'
+      ) {
+        const outcome = await processClarifyingAnswer(req.user!.id, id, content);
+        switch (outcome.kind) {
+          case 'not-found':
+            res.status(404).json({ success: false, error: 'Conversation not found' });
+            return;
+          case 'wrong-mode':
+          case 'wrong-status':
+            res.status(409).json({ success: false, error: 'Invalid research state' });
+            return;
+          case 'ai-error':
+            res.status(502).json({ success: false, error: 'AI provider error' });
+            return;
+          case 'questions':
+          case 'ready':
+            res.status(201).json({
+              success: true,
+              kind: outcome.kind,
+              conversation: outcome.conversation,
+              userMessage: outcome.userMessage,
+              assistantMessage: outcome.assistantMessage,
+            });
+            return;
+        }
+      }
+      if (
+        conversationMeta.mode === 'research' &&
+        conversationMeta.researchStatus !== 'idle' &&
+        conversationMeta.researchStatus !== 'complete' &&
+        conversationMeta.researchStatus !== 'failed'
+      ) {
+        res.status(409).json({
+          success: false,
+          error: 'Research is in progress; please wait for it to complete.',
+          code: 'RESEARCH_IN_PROGRESS',
+        });
+        return;
+      }
+    }
+
     const result = await appendUserMessage(req.user!.id, id, content);
 
     if (result.kind === 'not-found') {
