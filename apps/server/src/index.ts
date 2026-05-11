@@ -1,6 +1,4 @@
-import { config } from 'dotenv';
-config({ path: '../../.env' });
-
+import './env';
 import { app } from './app';
 import { startPeriodicCleanup } from './services/cleanup';
 
