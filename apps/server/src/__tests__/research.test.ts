@@ -3817,6 +3817,215 @@ Detailed body referencing [1] only.`);
   });
 });
 
+describe('runResearchPipeline Python sandbox integration', () => {
+  const mockedCreateSearchService = vi.mocked(createSearchService);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearTraceRecorder();
+    process.env.MAX_RESEARCH_ITERATIONS = '5';
+    process.env.MAX_LLM_CALLS_PER_RESEARCH = '10';
+    mockedPrisma.conversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      mode: 'research',
+      researchStatus: 'researching',
+      user: { preferredModel: 'openai:gpt-4o-mini', email: 'u@example.com' },
+    } as never);
+    mockedPrisma.message.findMany.mockResolvedValue([
+      { role: 'user', content: 'Sales analysis', metadata: null },
+      {
+        role: 'assistant',
+        content: 'READY: analyse the sales.',
+        metadata: { kind: 'research_ready', summary: 'analyse the sales.' },
+      },
+    ] as never);
+    mockedCreateSearchService.mockReturnValue({
+      remaining: vi.fn().mockReturnValue(20),
+      search: vi.fn().mockResolvedValue([
+        { title: 'A', url: 'https://a.example', snippet: 'sa' },
+        { title: 'B', url: 'https://b.example', snippet: 'sb' },
+        { title: 'C', url: 'https://c.example', snippet: 'sc' },
+      ]),
+    } as never);
+    mockedPrisma.message.create.mockResolvedValue({
+      id: 'm-final',
+      conversationId: 'conv-1',
+      role: 'assistant',
+      content: 'final',
+      createdAt: new Date(),
+    } as never);
+    mockedPrisma.conversation.update.mockResolvedValue({
+      id: 'conv-1',
+      userId: USER_ID,
+      title: 'Topic',
+      mode: 'research',
+      researchStatus: 'complete',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+  });
+
+  it('starts sandbox, runs schema extraction, processes EXECUTE_CODE blocks, and tears down', async () => {
+    mockedPrisma.file.findMany.mockResolvedValue([
+      {
+        id: 'f-1',
+        originalName: 'sales.csv',
+        summary: null,
+        extractedText: 'Data file',
+        mimeType: 'text/csv',
+        storagePath: '/uploads/abc.csv',
+      },
+    ] as never);
+
+    const sandboxExecute = vi
+      .fn()
+      .mockResolvedValueOnce({
+        stdout: 'rows: 100\ncolumns: [\'a\', \'b\']',
+        stderr: '',
+        images: [],
+        timedOut: false,
+      })
+      .mockResolvedValueOnce({
+        stdout: 'mean=42',
+        stderr: '',
+        images: [],
+        timedOut: false,
+      });
+    const sandboxStop = vi.fn().mockResolvedValue(undefined);
+    const sandboxStart = vi.fn().mockResolvedValue(undefined);
+    const sandboxFactory = vi.fn(() => ({
+      containerName: 'test',
+      isRunning: true,
+      start: sandboxStart,
+      execute: sandboxExecute,
+      stop: sandboxStop,
+    }));
+
+    const reviewCodeFn = vi.fn().mockResolvedValue({ safe: true });
+
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2') // planning
+      .mockResolvedValueOnce(
+        'First draft with code.\nEXECUTE_CODE:\n```python\nprint(df_0["a"].mean())\n```\nConclusion.',
+      )
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const progressEvents: Array<{ stage: string; cellsUsed?: number; cellBudget?: number }> = [];
+    const out = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+      sandboxFactory: sandboxFactory as never,
+      reviewCodeFn: reviewCodeFn as never,
+      onProgress: (p) => progressEvents.push(p as never),
+    });
+    expect(out.kind).toBe('ok');
+
+    expect(sandboxFactory).toHaveBeenCalledTimes(1);
+    expect(sandboxStart).toHaveBeenCalledTimes(1);
+    // first arg is the SandboxFile[] — should reference the storagePath
+    const startArg = sandboxStart.mock.calls[0][0] as Array<{ path: string; containerName: string }>;
+    expect(startArg[0].path).toBe('/uploads/abc.csv');
+    expect(startArg[0].containerName).toBe('sales.csv');
+
+    // schema extraction + one draft cell
+    expect(sandboxExecute).toHaveBeenCalledTimes(2);
+    expect(sandboxExecute.mock.calls[0][0]).toContain('pd.read_csv');
+    expect(sandboxExecute.mock.calls[0][0]).toContain('df_0.head(5)');
+    expect(sandboxExecute.mock.calls[1][0]).toContain('df_0["a"].mean()');
+
+    // review was called for the draft cell
+    expect(reviewCodeFn).toHaveBeenCalled();
+
+    // draft system prompt was augmented with schema preview
+    const draftCall = mockedGenerate.mock.calls[1];
+    const draftMessages = draftCall[0] as Array<{ role: string; content: string }>;
+    expect(draftMessages[0].content).toContain('EXECUTE_CODE:');
+    expect(draftMessages[0].content).toContain('sales.csv');
+    expect(draftMessages[0].content).toContain('rows: 100');
+
+    // sandbox stop called in finally
+    expect(sandboxStop).toHaveBeenCalled();
+
+    // SSE progress emitted executing_code
+    expect(progressEvents.some((e) => e.stage === 'executing_code')).toBe(true);
+    const cellEvents = progressEvents.filter((e) => e.cellsUsed !== undefined);
+    expect(cellEvents[cellEvents.length - 1]).toMatchObject({ cellBudget: 15 });
+
+    // codeExecutions stored in final message metadata
+    const createCall = mockedPrisma.message.create.mock.calls[0][0] as {
+      data: { metadata?: { codeExecutions?: unknown[]; codeCellsUsed?: number } };
+    };
+    const meta = createCall.data.metadata!;
+    expect(meta.codeCellsUsed).toBe(2);
+    expect(meta.codeExecutions).toHaveLength(2);
+    expect((meta.codeExecutions as Array<{ phase: string }>)[0].phase).toBe('schema');
+    expect((meta.codeExecutions as Array<{ phase: string }>)[1].phase).toBe('draft');
+  });
+
+  it('continues without sandbox when sandbox.start() throws and never trips the pipeline', async () => {
+    mockedPrisma.file.findMany.mockResolvedValue([
+      {
+        id: 'f-1',
+        originalName: 'sales.csv',
+        summary: null,
+        extractedText: 'Data file',
+        mimeType: 'text/csv',
+        storagePath: '/uploads/abc.csv',
+      },
+    ] as never);
+
+    const sandboxStop = vi.fn().mockResolvedValue(undefined);
+    const sandboxFactory = vi.fn(() => ({
+      containerName: 'test',
+      isRunning: false,
+      start: vi.fn().mockRejectedValue(new Error('docker missing')),
+      execute: vi.fn(),
+      stop: sandboxStop,
+    }));
+
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('Plain draft without code.')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+      sandboxFactory: sandboxFactory as never,
+    });
+    expect(out.kind).toBe('ok');
+    // stop called once during the catch cleanup; the outer finally short-circuits
+    expect(sandboxStop).toHaveBeenCalled();
+
+    // draft system prompt was NOT augmented (no sandbox available)
+    const draftCall = mockedGenerate.mock.calls[1];
+    const draftMessages = draftCall[0] as Array<{ role: string; content: string }>;
+    expect(draftMessages[0].content).not.toContain('EXECUTE_CODE:');
+  });
+
+  it('skips sandbox setup entirely when no data files are present', async () => {
+    mockedPrisma.file.findMany.mockResolvedValue([] as never);
+    const sandboxFactory = vi.fn();
+
+    mockedGenerate
+      .mockResolvedValueOnce('q1\nq2')
+      .mockResolvedValueOnce('plain draft')
+      .mockResolvedValueOnce(PERFECT_CRITIQUE)
+      .mockResolvedValueOnce(MOCK_REPORT);
+
+    const out = await runResearchPipeline({
+      userId: USER_ID,
+      conversationId: 'conv-1',
+      sandboxFactory: sandboxFactory as never,
+    });
+    expect(out.kind).toBe('ok');
+    expect(sandboxFactory).not.toHaveBeenCalled();
+  });
+});
+
 function parseSseEvents(body: string) {
   const events: { event: string; data: unknown }[] = [];
   for (const block of body.split('\n\n')) {

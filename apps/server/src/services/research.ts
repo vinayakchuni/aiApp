@@ -13,6 +13,21 @@ import {
   type SearchService,
 } from './search';
 import { createResearchTrace } from './tracing';
+import {
+  createSandbox as defaultCreateSandbox,
+  type Sandbox,
+  type SandboxFile,
+  type CreateSandboxOptions,
+} from './sandbox';
+import {
+  createCodeExecutor,
+  buildDataAnalysisDraftPrompt,
+  type CodeExecutionRecord,
+  type DataFileForSandbox,
+  type DataFileExtension,
+} from './codeExecutor';
+import { detectExtension, isDataFileExtension } from './extract';
+import { reviewCode as defaultReviewCode } from './codeReview';
 
 const activeResearchUsers = new Set<string>();
 
@@ -516,6 +531,7 @@ export type ResearchProgressStage =
   | 'critiquing'
   | 'fact_checking'
   | 'revising'
+  | 'executing_code'
   | 'finalizing';
 
 export interface ResearchProgress {
@@ -529,6 +545,8 @@ export interface ResearchProgress {
   scores?: CritiqueScores;
   claimsExtracted?: number;
   claimsVerified?: number;
+  cellsUsed?: number;
+  cellBudget?: number;
 }
 
 export interface CritiqueParseResult {
@@ -1158,6 +1176,8 @@ export interface RunResearchOptions {
   onProgress?: (progress: ResearchProgress) => void;
   searchService?: SearchService;
   abortSignal?: AbortSignal;
+  sandboxFactory?: (opts?: CreateSandboxOptions) => Sandbox;
+  reviewCodeFn?: typeof defaultReviewCode;
 }
 
 function readyMessageSummary(metadata: unknown): string | null {
@@ -1299,7 +1319,14 @@ async function runResearchPipelineImpl(
   const fileRows = await prisma.file.findMany({
     where: { conversationId },
     orderBy: { createdAt: 'asc' },
-    select: { id: true, originalName: true, summary: true, extractedText: true },
+    select: {
+      id: true,
+      originalName: true,
+      summary: true,
+      extractedText: true,
+      mimeType: true,
+      storagePath: true,
+    },
   });
   const researchFiles: ResearchFile[] = fileRows.map((f) => ({
     id: f.id,
@@ -1307,6 +1334,18 @@ async function runResearchPipelineImpl(
     summary: f.summary,
     extractedText: f.extractedText,
   }));
+  const dataFiles: DataFileForSandbox[] = [];
+  for (const f of fileRows) {
+    const ext = detectExtension(f.originalName ?? '', f.mimeType ?? '');
+    if (ext && isDataFileExtension(ext) && f.storagePath) {
+      dataFiles.push({
+        storagePath: f.storagePath,
+        containerName: f.originalName,
+        extension: ext as DataFileExtension,
+        originalName: f.originalName,
+      });
+    }
+  }
 
   const maxIterations = getMaxResearchIterations();
   const maxLlmCalls = getMaxLlmCallsPerResearch();
@@ -1328,9 +1367,18 @@ async function runResearchPipelineImpl(
     error?: string;
   } = {};
 
+  const sandboxRef: { current: Sandbox | null } = { current: null };
+
   try {
     return await runPipelineBody();
   } finally {
+    if (sandboxRef.current) {
+      try {
+        await sandboxRef.current.stop();
+      } catch (err) {
+        console.error('Sandbox stop failed:', err);
+      }
+    }
     await trace.finish(traceFinalize);
   }
 
@@ -1519,7 +1567,92 @@ async function runResearchPipelineImpl(
     return { kind: 'aborted' };
   }
 
+  let schemaPreview: string | null = null;
+  let codeExecutor: ReturnType<typeof createCodeExecutor> | null = null;
+  const codeExecutions: CodeExecutionRecord[] = [];
+
+  if (dataFiles.length > 0) {
+    onProgress?.({
+      stage: 'executing_code',
+      detail: `Preparing Python sandbox for ${dataFiles.length} data file(s)`,
+    });
+    const sandboxSetupSpan = trace.startSpan('sandbox-setup', {
+      metadata: { dataFileCount: dataFiles.length },
+    });
+    try {
+      const factory = options.sandboxFactory ?? defaultCreateSandbox;
+      sandboxRef.current = factory();
+      const sandbox = sandboxRef.current;
+      const sandboxFiles: SandboxFile[] = dataFiles.map((f) => ({
+        path: f.storagePath,
+        containerName: f.containerName,
+      }));
+      await sandbox.start(sandboxFiles);
+      codeExecutor = createCodeExecutor({
+        sandbox,
+        modelId,
+        abortSignal,
+        traceParent: sandboxSetupSpan,
+        reviewCodeFn: options.reviewCodeFn,
+        onProgress: (info) => {
+          onProgress?.({
+            stage: 'executing_code',
+            detail: `Code cell ${info.cellsUsed}/${info.cellBudget}`,
+            cellsUsed: info.cellsUsed,
+            cellBudget: info.cellBudget,
+          });
+        },
+      });
+      const schemaRec = await codeExecutor.runSchemaExtraction(dataFiles);
+      if (schemaRec) {
+        codeExecutions.push(schemaRec);
+        if (!schemaRec.error && !schemaRec.timedOut) {
+          schemaPreview = schemaRec.stdout.trim();
+        }
+      }
+      sandboxSetupSpan.end({
+        metadata: {
+          dataFileCount: dataFiles.length,
+          schemaCellSucceeded: !!schemaPreview,
+          cellsUsed: codeExecutor.cellsUsed,
+          cellBudget: codeExecutor.cellBudget,
+        },
+      });
+    } catch (err) {
+      console.error('Sandbox setup failed; continuing without code execution:', err);
+      sandboxSetupSpan.end({
+        level: 'ERROR',
+        statusMessage: 'sandbox setup failed',
+        metadata: { error: String(err) },
+      });
+      if (sandboxRef.current) {
+        try {
+          await sandboxRef.current.stop();
+        } catch {
+          // ignore
+        }
+        sandboxRef.current = null;
+      }
+      codeExecutor = null;
+    }
+  }
+
   onProgress?.({ stage: 'writing_draft', detail: 'Writing first draft' });
+
+  const draftSystemPrompt = codeExecutor
+    ? buildDataAnalysisDraftPrompt({
+        basePrompt: DRAFT_SYSTEM_PROMPT,
+        schemaPreview,
+        filenames: dataFiles.map((f) => f.originalName),
+      })
+    : DRAFT_SYSTEM_PROMPT;
+  const reviseSystemPrompt = codeExecutor
+    ? buildDataAnalysisDraftPrompt({
+        basePrompt: REVISE_SYSTEM_PROMPT,
+        schemaPreview,
+        filenames: dataFiles.map((f) => f.originalName),
+      })
+    : REVISE_SYSTEM_PROMPT;
 
   const draftingSpan = trace.startSpan('drafting');
   let currentDraft: string;
@@ -1527,7 +1660,7 @@ async function runResearchPipelineImpl(
     llmCallsUsed += 1;
     currentDraft = await generateAssistantText(
       [
-        { role: 'system', content: DRAFT_SYSTEM_PROMPT },
+        { role: 'system', content: draftSystemPrompt },
         {
           role: 'user',
           content: buildDraftUserPrompt(
@@ -1559,6 +1692,12 @@ async function runResearchPipelineImpl(
   draftingSpan.end({
     metadata: { draftLength: currentDraft.length, sourcesUsed: sources.length },
   });
+
+  if (codeExecutor) {
+    const processed = await codeExecutor.processDraft(currentDraft, 'draft');
+    currentDraft = processed.draft;
+    codeExecutions.push(...processed.records);
+  }
 
   const documentsUsed = researchFiles.map((f) => ({
     id: f.id,
@@ -1762,7 +1901,7 @@ async function runResearchPipelineImpl(
       llmCallsUsed += 1;
       revisedDraft = await generateAssistantText(
         [
-          { role: 'system', content: REVISE_SYSTEM_PROMPT },
+          { role: 'system', content: reviseSystemPrompt },
           {
             role: 'user',
             content: buildReviseUserPrompt(
@@ -1801,10 +1940,21 @@ async function runResearchPipelineImpl(
     }
 
     record.revised = true;
-    const similarity = draftSimilarity(currentDraft, revisedDraft);
-    currentDraft = revisedDraft;
+    let processedDraft = revisedDraft;
+    if (codeExecutor) {
+      const processed = await codeExecutor.processDraft(revisedDraft, 'revise');
+      processedDraft = processed.draft;
+      codeExecutions.push(...processed.records);
+    }
+    const similarity = draftSimilarity(currentDraft, processedDraft);
+    currentDraft = processedDraft;
     reviseSpan.end({
-      metadata: { iteration: i, similarity, draftLength: revisedDraft.length },
+      metadata: {
+        iteration: i,
+        similarity,
+        draftLength: processedDraft.length,
+        codeCellsUsed: codeExecutor?.cellsUsed,
+      },
     });
     if (similarity >= CONVERGENCE_SIMILARITY_THRESHOLD) {
       exitReason = 'converged';
@@ -1871,6 +2021,13 @@ async function runResearchPipelineImpl(
     exitReason,
     llmCallsUsed,
     report: structuredReport,
+    ...(codeExecutor
+      ? {
+          codeExecutions,
+          codeCellsUsed: codeExecutor.cellsUsed,
+          codeCellBudget: codeExecutor.cellBudget,
+        }
+      : {}),
   };
 
   const assistantMessage = await prisma.message.create({
