@@ -177,6 +177,7 @@ import {
   aggregateFactCheckRollup,
   parseCitedIndexes,
   computeSourceCitationRollup,
+  embedMissingChartsInReport,
   getLatestResearchFinal,
   isResearchActiveForUser,
   _resetActiveResearch,
@@ -1998,6 +1999,63 @@ describe('computeReportMethodology', () => {
       unverifiedClaims: 1,
       notCheckedClaims: 1,
     });
+  });
+});
+
+describe('embedMissingChartsInReport', () => {
+  const baseReport = {
+    executiveSummary: 'sum',
+    keyFindings: ['k'],
+    detailedAnalysis: 'paragraph one.',
+    sources: [],
+    methodology: {
+      queries: [],
+      iterationCount: 0,
+      finalScores: null,
+      factCheckSummary: {
+        totalClaimsExtracted: 0,
+        verifiedClaims: 0,
+        unverifiedClaims: 0,
+        notCheckedClaims: 0,
+      },
+    },
+  } as const;
+
+  const recBase = {
+    phase: 'draft' as const,
+    code: 'x',
+    stdout: '',
+    stderr: '',
+    timedOut: false,
+    durationMs: 1,
+    retries: 0,
+    reviewSafe: true,
+  };
+
+  it('returns the report unchanged when no images exist', () => {
+    const out = embedMissingChartsInReport(baseReport, []);
+    expect(out.detailedAnalysis).toBe('paragraph one.');
+  });
+
+  it('appends images that are not already referenced', () => {
+    const out = embedMissingChartsInReport(baseReport, [
+      { ...recBase, cellIndex: 2, images: ['AAA', 'BBB'] },
+    ]);
+    expect(out.detailedAnalysis).toContain('![chart-2-0](data:image/png;base64,AAA)');
+    expect(out.detailedAnalysis).toContain('![chart-2-1](data:image/png;base64,BBB)');
+    expect(out.detailedAnalysis).toContain('### Charts');
+  });
+
+  it('does not duplicate images already present in the analysis', () => {
+    const report = {
+      ...baseReport,
+      detailedAnalysis: 'See ![chart-2-0](data:image/png;base64,AAA) here.',
+    };
+    const out = embedMissingChartsInReport(report, [
+      { ...recBase, cellIndex: 2, images: ['AAA'] },
+    ]);
+    expect(out.detailedAnalysis).toBe(report.detailedAnalysis);
+    expect(out.detailedAnalysis.match(/chart-2-0/g)?.length).toBe(1);
   });
 });
 

@@ -1,12 +1,22 @@
 'use client';
 
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { Components } from 'react-markdown';
 
 const components: Components = {
+  img({ src, alt }) {
+    if (typeof src !== 'string') return null;
+    return (
+      <img
+        src={src}
+        alt={alt ?? ''}
+        className="my-2 max-w-full rounded border border-gray-200"
+      />
+    );
+  },
   code({ className, children, ...rest }) {
     const match = /language-(\w+)/.exec(className || '');
     const codeString = String(children).replace(/\n$/, '');
@@ -39,7 +49,13 @@ interface Props {
 export function MarkdownMessage({ content }: Props) {
   return (
     <div className="prose prose-sm max-w-none prose-headings:mt-3 prose-headings:mb-1 prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-pre:my-1 prose-pre:bg-transparent prose-pre:p-0">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={components}
+        urlTransform={(url) =>
+          url.startsWith('data:image/') ? url : defaultUrlTransform(url)
+        }
+      >
         {content}
       </ReactMarkdown>
     </div>

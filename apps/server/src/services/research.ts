@@ -430,7 +430,9 @@ KEY_FINDINGS:
 - <optional finding 5>
 
 DETAILED_ANALYSIS:
-<the main body of the report, organized into 2-5 paragraphs. Use the citations and the supplied sources. Do NOT repeat the executive summary verbatim. Do NOT list the sources here — they appear separately. Aim for 300-700 words.>`;
+<the main body of the report, organized into 2-5 paragraphs. Use the citations and the supplied sources. Do NOT repeat the executive summary verbatim. Do NOT list the sources here — they appear separately. Aim for 300-700 words.
+
+If the draft contains markdown image tags with base64 data URLs in the form ![chart-N-i](data:image/png;base64,...) — these are charts produced by the analysis tool. PRESERVE every such image tag verbatim, placing each one in the paragraph that discusses the chart's result. Do not summarize, rename, or omit the image tags.>`;
 
 export function parseSearchQueries(text: string): string[] {
   const lines = text
@@ -951,6 +953,24 @@ export function computeSourceCitationRollup(
     total: sources.length,
     cited: out.filter((s) => s.cited).length,
   };
+}
+
+export function embedMissingChartsInReport(
+  report: StructuredReport,
+  codeExecutions: readonly CodeExecutionRecord[],
+): StructuredReport {
+  const missing: string[] = [];
+  for (const rec of codeExecutions) {
+    rec.images.forEach((img, i) => {
+      const alt = `chart-${rec.cellIndex}-${i}`;
+      if (!report.detailedAnalysis.includes(alt)) {
+        missing.push(`![${alt}](data:image/png;base64,${img})`);
+      }
+    });
+  }
+  if (missing.length === 0) return report;
+  const appendix = `\n\n### Charts\n\n${missing.join('\n\n')}`;
+  return { ...report, detailedAnalysis: `${report.detailedAnalysis}${appendix}` };
 }
 
 const FALLBACK_EXECUTIVE_SUMMARY_SENTENCES = 2;
@@ -1992,6 +2012,9 @@ async function runResearchPipelineImpl(
       queries,
       finalScores,
     );
+  }
+  if (codeExecutions.length > 0) {
+    structuredReport = embedMissingChartsInReport(structuredReport, codeExecutions);
   }
   finalizingSpan.end({
     metadata: {

@@ -94,16 +94,58 @@ function writeSection(doc: PdfDoc, heading: string, body: () => void): void {
   body();
 }
 
+const BASE64_IMAGE_RE = /!\[[^\]]*\]\(data:image\/png;base64,([A-Za-z0-9+/=\s]+?)\)/g;
+
+export function splitParagraphByImages(
+  para: string,
+): Array<{ kind: 'text'; value: string } | { kind: 'image'; base64: string }> {
+  const out: Array<{ kind: 'text'; value: string } | { kind: 'image'; base64: string }> = [];
+  let last = 0;
+  BASE64_IMAGE_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = BASE64_IMAGE_RE.exec(para)) !== null) {
+    if (m.index > last) {
+      out.push({ kind: 'text', value: para.slice(last, m.index) });
+    }
+    out.push({ kind: 'image', base64: m[1].replace(/\s+/g, '') });
+    last = m.index + m[0].length;
+  }
+  if (last < para.length) out.push({ kind: 'text', value: para.slice(last) });
+  return out;
+}
+
 function writeParagraph(doc: PdfDoc, text: string): void {
   if (!text || text.trim().length === 0) {
     doc.font('Helvetica-Oblique').fillColor('#777777').text('(no content)');
     doc.font('Helvetica').fillColor('black');
     return;
   }
+  const usableWidth = doc.page.width - PAGE_MARGIN * 2;
   for (const para of text.split(/\n\s*\n/)) {
-    const cleaned = para.trim().replace(/\n+/g, ' ');
-    if (!cleaned) continue;
-    doc.text(cleaned, { align: 'left' });
+    const trimmed = para.trim();
+    if (!trimmed) continue;
+    const segments = splitParagraphByImages(trimmed);
+    for (const seg of segments) {
+      if (seg.kind === 'text') {
+        const cleaned = seg.value.trim().replace(/\n+/g, ' ');
+        if (!cleaned) continue;
+        doc.text(cleaned, { align: 'left' });
+      } else {
+        try {
+          const buf = Buffer.from(seg.base64, 'base64');
+          ensureSpace(doc, 220);
+          doc.moveDown(0.3);
+          doc.image(buf, { fit: [usableWidth, 320], align: 'center' });
+          doc.moveDown(0.3);
+        } catch (err) {
+          doc
+            .font('Helvetica-Oblique')
+            .fillColor('#777777')
+            .text(`(chart could not be rendered: ${(err as Error).message})`);
+          doc.font('Helvetica').fillColor('black');
+        }
+      }
+    }
     doc.moveDown(0.5);
   }
 }

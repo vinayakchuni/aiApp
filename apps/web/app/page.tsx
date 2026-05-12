@@ -295,9 +295,9 @@ function ResearchFinalPanel({
             <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">
               Detailed Analysis
             </summary>
-            <p className="mt-2 whitespace-pre-wrap leading-relaxed text-gray-800">
-              {report.detailedAnalysis}
-            </p>
+            <div className="mt-2 leading-relaxed text-gray-800">
+              <MarkdownMessage content={report.detailedAnalysis} />
+            </div>
           </details>
           <details className="rounded-md border border-purple-200 bg-white p-2">
             <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-wide text-purple-700">

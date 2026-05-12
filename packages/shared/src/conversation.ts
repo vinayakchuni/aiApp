@@ -97,6 +97,24 @@ export interface StructuredReport {
   methodology: ReportMethodology;
 }
 
+export type CodeExecutionPhase = 'schema' | 'draft' | 'revise';
+
+export interface CodeExecutionRecord {
+  cellIndex: number;
+  phase: CodeExecutionPhase;
+  code: string;
+  stdout: string;
+  stderr: string;
+  images: string[];
+  timedOut: boolean;
+  error?: string;
+  errorType?: string;
+  durationMs: number;
+  retries: number;
+  reviewSafe: boolean;
+  reviewReason?: string;
+}
+
 export type MessageMetadata =
   | { kind: 'clarifying_questions'; questions: string[] }
   | { kind: 'research_ready'; summary?: string }
@@ -117,6 +135,9 @@ export type MessageMetadata =
       exitReason: ResearchExitReason;
       llmCallsUsed: number;
       report?: StructuredReport;
+      codeExecutions?: CodeExecutionRecord[];
+      codeCellsUsed?: number;
+      codeCellBudget?: number;
     }
   | { kind: 'research_failed'; reason: string }
   | { kind: string; [key: string]: unknown };
