@@ -16,14 +16,29 @@ export interface AssistantTextStream {
   textStream: AsyncIterable<string>;
 }
 
+function extractSystemPrompt(messages: LLMMessage[]): {
+  system: string | undefined;
+  nonSystemMessages: LLMMessage[];
+} {
+  const systemMessages = messages.filter((m) => m.role === 'system');
+  const nonSystemMessages = messages.filter((m) => m.role !== 'system');
+  const system =
+    systemMessages.length > 0
+      ? systemMessages.map((m) => m.content).join('\n\n')
+      : undefined;
+  return { system, nonSystemMessages };
+}
+
 export function streamAssistantText(
   messages: LLMMessage[],
   modelId: string = DEFAULT_MODEL_ID,
   abortSignal?: AbortSignal,
 ): AssistantTextStream {
+  const { system, nonSystemMessages } = extractSystemPrompt(messages);
   return streamText({
     model: resolveModel(modelId),
-    messages,
+    system,
+    messages: nonSystemMessages,
     abortSignal,
   });
 }
@@ -45,9 +60,11 @@ export async function generateAssistantText(
 ): Promise<string> {
   const generation = startGeneration(modelId, messages, options);
   try {
+    const { system, nonSystemMessages } = extractSystemPrompt(messages);
     const result = await generateText({
       model: resolveModel(modelId),
-      messages,
+      system,
+      messages: nonSystemMessages,
     });
     generation?.end({
       output: result.text,
