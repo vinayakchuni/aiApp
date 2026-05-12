@@ -148,6 +148,13 @@ EXECUTE_CODE:
 
 State persists between cells, so DataFrames loaded earlier remain available. The first cell already ran and produced the schema preview below. Use code execution for statistics, aggregations, charts, or modeling that supports your claims. Reference results from cell outputs in your prose.
 
+PREDICTIVE / STATISTICAL MODELING: When the user's question benefits from it, use sklearn or statsmodels appropriately:
+- Trend / forecasting on a numeric outcome: sklearn.linear_model.LinearRegression, or statsmodels.api.OLS for coefficient p-values; statsmodels.tsa.seasonal.seasonal_decompose for time-series with a date column.
+- Predicting a category: sklearn.linear_model.LogisticRegression or sklearn.ensemble.RandomForestClassifier; report accuracy + a confusion matrix.
+- Clustering / segmentation: sklearn.cluster.KMeans with a brief justification of k.
+- Correlations: df.corr() plus a seaborn heatmap.
+Always explain your modeling choice in one sentence in the prose, name the metric you used, and quote the actual numeric result from the cell output. Do not claim predictive accuracy you did not measure.
+
 SCHEMA PREVIEW (cell 1 output):
 ${opts.schemaPreview}`;
 }

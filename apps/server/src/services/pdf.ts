@@ -224,6 +224,46 @@ function writeMethodology(
   doc.text(`  Verified: ${fc.verifiedClaims}`);
   doc.text(`  Unverified: ${fc.unverifiedClaims}`);
   doc.text(`  Not checked: ${fc.notCheckedClaims}`);
+
+  if (methodology.codeCells && methodology.codeCells.length > 0) {
+    doc.moveDown(0.4).font('Helvetica-Bold').text(
+      `Code cells executed (${methodology.codeCellsUsed ?? methodology.codeCells.length}` +
+        (methodology.codeCellBudget ? `/${methodology.codeCellBudget}` : '') +
+        '):',
+    );
+    doc.font('Helvetica');
+    for (const cell of methodology.codeCells) {
+      ensureSpace(doc, 80);
+      const badge = cell.timedOut
+        ? ' [timed out]'
+        : cell.error
+          ? ` [error: ${cell.errorType ?? 'Error'}]`
+          : '';
+      doc
+        .moveDown(0.3)
+        .font('Helvetica-Bold')
+        .text(
+          `  Cell ${cell.cellIndex} — ${cell.phase} — ${cell.durationMs}ms` +
+            (cell.imageCount > 0 ? ` — ${cell.imageCount} chart(s)` : '') +
+            badge,
+        );
+      doc.font('Courier').fontSize(9);
+      for (const line of cell.code.split('\n').slice(0, 12)) {
+        doc.text(`    ${line}`);
+      }
+      if (cell.code.split('\n').length > 12) {
+        doc.text('    …');
+      }
+      doc.font('Helvetica').fontSize(11);
+      if (cell.outputPreview.length > 0) {
+        doc.font('Helvetica-Oblique').fillColor('#555555');
+        for (const line of cell.outputPreview.split('\n').slice(0, 8)) {
+          doc.text(`    ${line}`);
+        }
+        doc.font('Helvetica').fillColor('black');
+      }
+    }
+  }
 }
 
 function ensureSpace(doc: PdfDoc, minRemaining: number): void {

@@ -23,6 +23,7 @@ import {
   createCodeExecutor,
   buildDataAnalysisDraftPrompt,
   type CodeExecutionRecord,
+  type CodeExecutionPhase,
   type DataFileForSandbox,
   type DataFileExtension,
 } from './codeExecutor';
@@ -755,11 +756,26 @@ export interface ReportFactCheckSummary {
   notCheckedClaims: number;
 }
 
+export interface ReportCodeCellSummary {
+  cellIndex: number;
+  phase: CodeExecutionPhase;
+  code: string;
+  outputPreview: string;
+  imageCount: number;
+  durationMs: number;
+  timedOut: boolean;
+  error?: string;
+  errorType?: string;
+}
+
 export interface ReportMethodology {
   queries: string[];
   iterationCount: number;
   finalScores: CritiqueScores | null;
   factCheckSummary: ReportFactCheckSummary;
+  codeCells?: ReportCodeCellSummary[];
+  codeCellsUsed?: number;
+  codeCellBudget?: number;
 }
 
 export interface StructuredReport {
@@ -836,10 +852,42 @@ export function computeReportSources(
   }));
 }
 
+const CODE_CELL_PREVIEW_BYTES = 400;
+
+export function summarizeCodeExecutions(
+  codeExecutions: readonly CodeExecutionRecord[],
+): ReportCodeCellSummary[] {
+  return codeExecutions.map((rec) => {
+    const stdout = rec.stdout.trim();
+    const preview =
+      stdout.length > CODE_CELL_PREVIEW_BYTES
+        ? stdout.slice(0, CODE_CELL_PREVIEW_BYTES) + '…'
+        : stdout;
+    return {
+      cellIndex: rec.cellIndex,
+      phase: rec.phase,
+      code: rec.code,
+      outputPreview: preview,
+      imageCount: rec.images.length,
+      durationMs: rec.durationMs,
+      timedOut: rec.timedOut,
+      ...(rec.error ? { error: rec.error } : {}),
+      ...(rec.errorType ? { errorType: rec.errorType } : {}),
+    };
+  });
+}
+
+export interface ComputeReportMethodologyCodeOptions {
+  codeExecutions?: readonly CodeExecutionRecord[];
+  codeCellsUsed?: number;
+  codeCellBudget?: number;
+}
+
 export function computeReportMethodology(
   queries: string[],
   iterations: CritiqueIterationRecord[],
   finalScores: CritiqueScores | null,
+  codeOpts?: ComputeReportMethodologyCodeOptions,
 ): ReportMethodology {
   let total = 0;
   let verified = 0;
@@ -854,7 +902,7 @@ export function computeReportMethodology(
       else notChecked += 1;
     }
   }
-  return {
+  const base: ReportMethodology = {
     queries,
     iterationCount: iterations.length,
     finalScores,
@@ -865,6 +913,16 @@ export function computeReportMethodology(
       notCheckedClaims: notChecked,
     },
   };
+  if (codeOpts && codeOpts.codeExecutions && codeOpts.codeExecutions.length > 0) {
+    base.codeCells = summarizeCodeExecutions(codeOpts.codeExecutions);
+    if (typeof codeOpts.codeCellsUsed === 'number') {
+      base.codeCellsUsed = codeOpts.codeCellsUsed;
+    }
+    if (typeof codeOpts.codeCellBudget === 'number') {
+      base.codeCellBudget = codeOpts.codeCellBudget;
+    }
+  }
+  return base;
 }
 
 export interface TraceFactCheckRollup {
@@ -981,6 +1039,7 @@ export function programmaticReportFromDraft(
   iterations: CritiqueIterationRecord[],
   queries: string[],
   finalScores: CritiqueScores | null,
+  codeOpts?: ComputeReportMethodologyCodeOptions,
 ): StructuredReport {
   const cleaned = draft.trim();
   const sentences = cleaned
@@ -1002,7 +1061,7 @@ export function programmaticReportFromDraft(
     keyFindings: keyFindings.length > 0 ? keyFindings : [cleaned.slice(0, 200)],
     detailedAnalysis: cleaned,
     sources: computeReportSources(sources, iterations),
-    methodology: computeReportMethodology(queries, iterations, finalScores),
+    methodology: computeReportMethodology(queries, iterations, finalScores, codeOpts),
   };
 }
 
@@ -1018,6 +1077,9 @@ export interface BuildStructuredReportOptions {
   generateFn?: typeof generateAssistantText;
   abortSignal?: AbortSignal;
   traceParent?: TracingContext;
+  codeExecutions?: readonly CodeExecutionRecord[];
+  codeCellsUsed?: number;
+  codeCellBudget?: number;
 }
 
 export interface BuildStructuredReportRun {
@@ -1040,7 +1102,14 @@ export async function buildStructuredReport(
     modelId,
     generateFn = generateAssistantText,
     traceParent,
+    codeExecutions,
+    codeCellsUsed,
+    codeCellBudget,
   } = opts;
+  const codeOpts: ComputeReportMethodologyCodeOptions | undefined =
+    codeExecutions && codeExecutions.length > 0
+      ? { codeExecutions, codeCellsUsed, codeCellBudget }
+      : undefined;
 
   let text: string;
   try {
@@ -1064,6 +1133,7 @@ export async function buildStructuredReport(
         iterations,
         queries,
         finalScores,
+        codeOpts,
       ),
       llmCallsAttempted: 1,
       source: 'programmatic',
@@ -1080,6 +1150,7 @@ export async function buildStructuredReport(
         iterations,
         queries,
         finalScores,
+        codeOpts,
       ),
       llmCallsAttempted: 1,
       source: 'programmatic',
@@ -1092,7 +1163,7 @@ export async function buildStructuredReport(
       keyFindings: parsed.keyFindings,
       detailedAnalysis: parsed.detailedAnalysis,
       sources: computeReportSources(sources, iterations),
-      methodology: computeReportMethodology(queries, iterations, finalScores),
+      methodology: computeReportMethodology(queries, iterations, finalScores, codeOpts),
     },
     llmCallsAttempted: 1,
     source: 'llm',
@@ -2000,6 +2071,9 @@ async function runResearchPipelineImpl(
       modelId,
       abortSignal,
       traceParent: finalizingSpan,
+      codeExecutions,
+      codeCellsUsed: codeExecutor?.cellsUsed,
+      codeCellBudget: codeExecutor?.cellBudget,
     });
     llmCallsUsed += reportRun.llmCallsAttempted;
     structuredReport = reportRun.report;
@@ -2011,6 +2085,13 @@ async function runResearchPipelineImpl(
       iterations,
       queries,
       finalScores,
+      codeExecutions.length > 0
+        ? {
+            codeExecutions,
+            codeCellsUsed: codeExecutor?.cellsUsed,
+            codeCellBudget: codeExecutor?.cellBudget,
+          }
+        : undefined,
     );
   }
   if (codeExecutions.length > 0) {

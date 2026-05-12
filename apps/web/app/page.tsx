@@ -205,6 +205,52 @@ function MethodologyView({ methodology }: { methodology: StructuredReport['metho
           <li>Not checked: {fc.notCheckedClaims}</li>
         </ul>
       </div>
+      {methodology.codeCells && methodology.codeCells.length > 0 && (
+        <div>
+          <div className="font-semibold text-gray-700">
+            Code cells executed
+            {typeof methodology.codeCellsUsed === 'number' && (
+              <>
+                {' '}
+                ({methodology.codeCellsUsed}
+                {typeof methodology.codeCellBudget === 'number'
+                  ? `/${methodology.codeCellBudget}`
+                  : ''}
+                )
+              </>
+            )}
+          </div>
+          <ol className="space-y-2 pl-5">
+            {methodology.codeCells.map((cell) => (
+              <li key={cell.cellIndex} className="space-y-1">
+                <div className="text-gray-700">
+                  <strong>
+                    Cell {cell.cellIndex} — {cell.phase}
+                  </strong>{' '}
+                  <span className="text-gray-500">
+                    ({cell.durationMs}ms
+                    {cell.imageCount > 0 ? `, ${cell.imageCount} chart(s)` : ''}
+                    {cell.timedOut
+                      ? ', timed out'
+                      : cell.error
+                        ? `, ${cell.errorType ?? 'error'}`
+                        : ''}
+                    )
+                  </span>
+                </div>
+                <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-gray-100 p-2 text-[11px] text-gray-800">
+                  {cell.code}
+                </pre>
+                {cell.outputPreview && (
+                  <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-gray-50 p-2 text-[11px] italic text-gray-600">
+                    {cell.outputPreview}
+                  </pre>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
     </div>
   );
 }

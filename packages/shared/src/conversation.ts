@@ -82,11 +82,26 @@ export interface ReportFactCheckSummary {
   notCheckedClaims: number;
 }
 
+export interface ReportCodeCellSummary {
+  cellIndex: number;
+  phase: CodeExecutionPhase;
+  code: string;
+  outputPreview: string;
+  imageCount: number;
+  durationMs: number;
+  timedOut: boolean;
+  error?: string;
+  errorType?: string;
+}
+
 export interface ReportMethodology {
   queries: string[];
   iterationCount: number;
   finalScores: CritiqueScores | null;
   factCheckSummary: ReportFactCheckSummary;
+  codeCells?: ReportCodeCellSummary[];
+  codeCellsUsed?: number;
+  codeCellBudget?: number;
 }
 
 export interface StructuredReport {
