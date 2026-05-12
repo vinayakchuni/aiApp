@@ -1696,7 +1696,7 @@ export default function Home() {
                     ref={fileInputRef}
                     type="file"
                     multiple
-                    accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                    accept=".pdf,.docx,.txt,.csv,.xlsx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     onChange={(e) => void handleUploadFiles(e.target.files)}
                     className="hidden"
                   />

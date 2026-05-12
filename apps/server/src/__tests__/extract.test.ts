@@ -20,6 +20,8 @@ import {
   detectExtension,
   extractText,
   extensionFromName,
+  isDataFileExtension,
+  DATA_FILE_PLACEHOLDER,
 } from '../services/extract';
 
 const mockedPDF = vi.mocked(PDFParse);
@@ -45,6 +47,27 @@ describe('extract.detectExtension', () => {
 
   it('detects txt from filename', () => {
     expect(detectExtension('readme.txt', 'text/plain')).toBe('txt');
+  });
+
+  it('detects csv from filename and mime', () => {
+    expect(detectExtension('data.csv', 'text/csv')).toBe('csv');
+    expect(detectExtension('blob', 'text/csv')).toBe('csv');
+    expect(detectExtension('blob', 'application/csv')).toBe('csv');
+  });
+
+  it('detects xlsx from filename and mime', () => {
+    expect(
+      detectExtension(
+        'sheet.xlsx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ),
+    ).toBe('xlsx');
+    expect(
+      detectExtension(
+        'blob',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ),
+    ).toBe('xlsx');
   });
 
   it('falls back to mime type when extension is missing', () => {
@@ -86,5 +109,27 @@ describe('extract.extractText', () => {
     const text = await extractText(buf, 'docx');
     expect(text).toBe('hello docx world');
     expect(mockedMammoth).toHaveBeenCalledWith({ buffer: buf });
+  });
+
+  it('returns a placeholder for csv buffers without parsing them', async () => {
+    const buf = Buffer.from('col1,col2\n1,2\n3,4\n');
+    const text = await extractText(buf, 'csv');
+    expect(text).toBe(DATA_FILE_PLACEHOLDER);
+  });
+
+  it('returns a placeholder for xlsx buffers without parsing them', async () => {
+    const buf = Buffer.from('binary xlsx bytes');
+    const text = await extractText(buf, 'xlsx');
+    expect(text).toBe(DATA_FILE_PLACEHOLDER);
+  });
+});
+
+describe('extract.isDataFileExtension', () => {
+  it('is true for csv and xlsx, false for the rest', () => {
+    expect(isDataFileExtension('csv')).toBe(true);
+    expect(isDataFileExtension('xlsx')).toBe(true);
+    expect(isDataFileExtension('pdf')).toBe(false);
+    expect(isDataFileExtension('docx')).toBe(false);
+    expect(isDataFileExtension('txt')).toBe(false);
   });
 });

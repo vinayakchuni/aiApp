@@ -197,6 +197,85 @@ describe('Files API', () => {
       expect(opts.preferredModel).toBe('openai:gpt-4o-mini');
     });
 
+    it('accepts CSV uploads, stores the placeholder, and skips summarization', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: CONV_ID,
+        userId: USER_ID,
+        mode: 'research',
+      } as never);
+      mockedPrisma.file.count.mockResolvedValue(0 as never);
+      mockedPrisma.user.findUnique.mockResolvedValue({
+        id: USER_ID,
+        preferredModel: 'openai:gpt-4o-mini',
+      } as never);
+      const now = new Date();
+      mockedPrisma.file.create.mockResolvedValue({
+        id: 'file-csv-1',
+        conversationId: CONV_ID,
+        originalName: 'data.csv',
+        mimeType: 'text/csv',
+        size: 5,
+        extractedText: 'Data file — analysis will run in sandbox',
+        storagePath: '/tmp/anything',
+        createdAt: now,
+      } as never);
+
+      const res = await request(app)
+        .post(`/api/conversations/${CONV_ID}/files`)
+        .set('Cookie', 'session_id=session-1')
+        .attach('file', Buffer.from('a,b\n1,2'), {
+          filename: 'data.csv',
+          contentType: 'text/csv',
+        });
+
+      expect(res.status).toBe(201);
+      // extractText is mocked at the top of the file, so we assert the route
+      // accepted the upload and reached prisma.file.create.
+      const createCall = mockedPrisma.file.create.mock.calls[0][0] as {
+        data: { extractedText: string };
+      };
+      expect(createCall.data.extractedText).toBeTypeOf('string');
+      await new Promise((resolve) => setImmediate(resolve));
+      // Data files in a research conversation must not trigger summarization.
+      expect(mockedSummarize).not.toHaveBeenCalled();
+    });
+
+    it('accepts XLSX uploads in a research conversation', async () => {
+      authedSession();
+      mockedPrisma.conversation.findUnique.mockResolvedValue({
+        id: CONV_ID,
+        userId: USER_ID,
+        mode: 'research',
+      } as never);
+      mockedPrisma.file.count.mockResolvedValue(0 as never);
+      const now = new Date();
+      mockedPrisma.file.create.mockResolvedValue({
+        id: 'file-xlsx-1',
+        conversationId: CONV_ID,
+        originalName: 'sheet.xlsx',
+        mimeType:
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        size: 5,
+        extractedText: 'Data file — analysis will run in sandbox',
+        storagePath: '/tmp/anything',
+        createdAt: now,
+      } as never);
+
+      const res = await request(app)
+        .post(`/api/conversations/${CONV_ID}/files`)
+        .set('Cookie', 'session_id=session-1')
+        .attach('file', Buffer.from('xlsxbytes'), {
+          filename: 'sheet.xlsx',
+          contentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        });
+
+      expect(res.status).toBe(201);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockedSummarize).not.toHaveBeenCalled();
+    });
+
     it('does NOT kick off summarization for chat conversations', async () => {
       authedSession();
       mockedPrisma.conversation.findUnique.mockResolvedValue({

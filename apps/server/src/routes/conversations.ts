@@ -255,7 +255,7 @@ conversationsRouter.post(
         });
         return;
       case 'ok':
-        if (outcome.isResearchConversation) {
+        if (outcome.isResearchConversation && !outcome.isDataFile) {
           void kickoffFileSummarization(req.user!.id, outcome.file.id).catch(
             (err) => console.error('Background summarization failed:', err),
           );

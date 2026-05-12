@@ -2,12 +2,17 @@ import path from 'path';
 import { promises as fs } from 'fs';
 import crypto from 'crypto';
 import { prisma } from '../lib/db';
-import { detectExtension, extractText, SUPPORTED_EXTENSIONS } from './extract';
+import {
+  detectExtension,
+  extractText,
+  isDataFileExtension,
+  SUPPORTED_EXTENSIONS,
+} from './extract';
 import { summarizeFile } from './summarize';
 
 const DEFAULT_UPLOAD_DIR = path.join(process.cwd(), 'uploads');
-const DEFAULT_MAX_FILES = 2;
-const DEFAULT_MAX_FILE_SIZE_MB = 5;
+const DEFAULT_MAX_FILES = 5;
+const DEFAULT_MAX_FILE_SIZE_MB = 10;
 
 export function getUploadDir(): string {
   return process.env.UPLOAD_DIR || DEFAULT_UPLOAD_DIR;
@@ -36,6 +41,7 @@ export type UploadOutcome =
       kind: 'ok';
       file: Awaited<ReturnType<typeof prisma.file.create>>;
       isResearchConversation: boolean;
+      isDataFile: boolean;
     }
   | { kind: 'not-found' }
   | { kind: 'unsupported-type' }
@@ -106,6 +112,7 @@ export async function ingestUploadedFile(input: UploadInput): Promise<UploadOutc
     kind: 'ok',
     file,
     isResearchConversation: conversation.mode === 'research',
+    isDataFile: isDataFileExtension(extension),
   };
 }
 

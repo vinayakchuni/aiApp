@@ -1,9 +1,19 @@
 import { PDFParse } from 'pdf-parse';
 import mammoth from 'mammoth';
 
-export type SupportedExtension = 'pdf' | 'docx' | 'txt';
+export type SupportedExtension = 'pdf' | 'docx' | 'txt' | 'csv' | 'xlsx';
 
-export const SUPPORTED_EXTENSIONS: readonly SupportedExtension[] = ['pdf', 'docx', 'txt'];
+export const SUPPORTED_EXTENSIONS: readonly SupportedExtension[] = [
+  'pdf',
+  'docx',
+  'txt',
+  'csv',
+  'xlsx',
+];
+
+export const DATA_FILE_EXTENSIONS: readonly SupportedExtension[] = ['csv', 'xlsx'];
+
+export const DATA_FILE_PLACEHOLDER = 'Data file — analysis will run in sandbox';
 
 export const SUPPORTED_MIME_TYPES: Readonly<Record<SupportedExtension, readonly string[]>> = {
   pdf: ['application/pdf'],
@@ -12,7 +22,13 @@ export const SUPPORTED_MIME_TYPES: Readonly<Record<SupportedExtension, readonly 
     'application/msword',
   ],
   txt: ['text/plain'],
+  csv: ['text/csv', 'application/csv'],
+  xlsx: ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
 };
+
+export function isDataFileExtension(ext: SupportedExtension): boolean {
+  return (DATA_FILE_EXTENSIONS as readonly string[]).includes(ext);
+}
 
 export function extensionFromName(name: string): string | null {
   const dot = name.lastIndexOf('.');
@@ -49,5 +65,8 @@ export async function extractText(
     }
     case 'txt':
       return buffer.toString('utf8').trim();
+    case 'csv':
+    case 'xlsx':
+      return DATA_FILE_PLACEHOLDER;
   }
 }
